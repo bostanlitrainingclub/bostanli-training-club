@@ -1,0 +1,8 @@
+@import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body { font-family: 'Inter', system-ui, sans-serif; }
+input, select, button, textarea { font-family: inherit; }
+input:focus, select:focus, textarea:focus { outline: 2px solid #1F6F54; outline-offset: 1px; }
+button:focus-visible { outline: 2px solid #1F6F54; outline-offset: 2px; }

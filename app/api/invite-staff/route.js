@@ -6,20 +6,26 @@ import { createAdminClient } from "../../../lib/supabase/admin";
 export async function POST(request) {
   const supabase = createClient();
 
-  // Confirm the caller is actually logged in and is an Admin before doing anything.
+  // Confirm the caller is actually logged in.
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) {
     return NextResponse.json({ error: "Giriş yapmanız gerekiyor." }, { status: 401 });
   }
-  const { data: callerStaff, error: callerError } = await supabase
+
+  // Look up their role using the admin client (bypasses Row Level Security).
+  // We've already verified above that `user` is a genuine, authenticated
+  // account via Supabase's own auth check — this lookup is just reading
+  // their role, not a security boundary in itself, so bypassing RLS here
+  // is safe and avoids relying on RLS policies behaving a particular way
+  // for this one internal check.
+  const admin = createAdminClient();
+  const { data: callerStaff, error: callerError } = await admin
     .from("staff")
     .select("role")
     .eq("auth_user_id", user.id)
     .maybeSingle();
 
   if (callerError) {
-    // Temporary: surface the real database error instead of a generic message,
-    // so we can see exactly what's going wrong.
     return NextResponse.json({ error: "DB hatası (yetki kontrolü): " + callerError.message }, { status: 500 });
   }
   if (!callerStaff) {
@@ -34,7 +40,6 @@ export async function POST(request) {
     return NextResponse.json({ error: "E-posta ve isim gerekli." }, { status: 400 });
   }
 
-  const admin = createAdminClient();
   const redirectTo = `${process.env.NEXT_PUBLIC_SITE_URL}/login`;
 
   const { data: invited, error: inviteError } = await admin.auth.admin.inviteUserByEmail(email, { redirectTo });

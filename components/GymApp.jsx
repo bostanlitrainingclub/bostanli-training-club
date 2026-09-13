@@ -497,6 +497,7 @@ export default function GymApp({ myStaffId, myRole, myName }) {
           <StaffTab
             staff={staff} setStaff={setStaff} sessions={sessions} customers={customers}
             commissionRates={commissionRates} setCommissionRates={setCommissionRates}
+            currentPtId={currentPtId}
           />
         )}
         {tab === "groupClasses" && role === "owner" && (
@@ -2323,7 +2324,7 @@ function FinancialReportsTab({ customers, sessions, staff, commissionRates }) {
 /* ---------------------------------------------------------------
    HOCALAR (STAFF)
 ------------------------------------------------------------------*/
-function StaffTab({ staff, setStaff, sessions, customers, commissionRates, setCommissionRates }) {
+function StaffTab({ staff, setStaff, sessions, customers, commissionRates, setCommissionRates, currentPtId }) {
   const [staffModalTarget, setStaffModalTarget] = useState(null); // null | "new" | trainer object
   const [viewingId, setViewingId] = useState(null);
 
@@ -2378,12 +2379,23 @@ function StaffTab({ staff, setStaff, sessions, customers, commissionRates, setCo
                   style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}
                 >
                   <div style={{ fontWeight: 700, fontSize: 15.5, color: "var(--ink)", textDecoration: "underline", textDecorationColor: "var(--border)", textUnderlineOffset: 3 }}>
-                    {s.name}
+                    {s.name}{s.id === currentPtId ? " (Siz)" : ""}
                   </div>
                 </button>
                 <div style={{ display: "flex", gap: 6 }}>
                   <button style={styles.iconBtn} onClick={() => setStaffModalTarget(s)}><Pencil size={14} /></button>
-                  <button style={styles.iconBtn} onClick={() => { if (confirm(`${s.name} adlı antrenörü silmek istediğinize emin misiniz? Bu işlem geri alınamaz.`)) removeStaff(s.id); }}><Trash2 size={14} /></button>
+                  <button
+                    style={styles.iconBtn}
+                    onClick={() => {
+                      if (s.id === currentPtId) {
+                        alert("Kendi hesabınızı silemezsiniz — bu, giriş yapan kişinin admin bağlantısını kopartır. Başka bir admin sizin adınıza silmeli.");
+                        return;
+                      }
+                      if (confirm(`${s.name} adlı antrenörü silmek istediğinize emin misiniz? Bu işlem geri alınamaz.`)) removeStaff(s.id);
+                    }}
+                  >
+                    <Trash2 size={14} />
+                  </button>
                 </div>
               </div>
               <div style={{ display: "flex", gap: 4, marginTop: 8 }}>

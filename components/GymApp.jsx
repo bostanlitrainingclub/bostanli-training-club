@@ -260,13 +260,14 @@ function refundPackageSession(customer, type) {
 ------------------------------------------------------------------*/
 export default function GymApp({ myStaffId, myRole, myName }) {
   const [ready, setReady] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
   const role = myRole; // 'owner' | 'pt' — now comes from a real, verified login
   const currentPtId = myStaffId;
   const [tab, setTab] = useState("dashboard");
   const supabase = useMemo(() => createSupabaseBrowserClient(), []);
 
   const [customers, setCustomers] = useState([]);
-  const [staff, setStaff] = useState(SEED_STAFF);
+  const [staff, setStaff] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [commissionRates, setCommissionRates] = useState({});
   const [groupClasses, setGroupClasses] = useState([]);
@@ -285,11 +286,13 @@ export default function GymApp({ myStaffId, myRole, myName }) {
         setCommissionRates(data.commissionRates);
         setGroupClasses(data.groupClasses);
         prevRef.current = data;
+        setReady(true);
       } catch (err) {
         console.error("Failed to load data from Supabase:", err);
-        alert("Veriler yüklenirken bir sorun oluştu. Sayfayı yenileyip tekrar deneyin.");
-      } finally {
-        setReady(true);
+        // Deliberately do NOT set ready=true here — that would let the sync
+        // effects below run against empty/placeholder state and start writing
+        // it to the database, potentially overwriting real data with nothing.
+        setLoadFailed(true);
       }
     })();
   }, [supabase]);
@@ -319,6 +322,17 @@ export default function GymApp({ myStaffId, myRole, myName }) {
     syncCommissionRates(supabase, prevRef.current.commissionRates, commissionRates);
     prevRef.current.commissionRates = commissionRates;
   }, [commissionRates, ready, supabase]);
+
+  // All hooks are declared above this point — safe to return early from here on,
+  // since no hook calls happen after this in the component.
+  if (loadFailed) {
+    return (
+      <div style={{ padding: 40, fontFamily: "Inter, sans-serif" }}>
+        <h2>Veriler yüklenemedi</h2>
+        <p>Bir bağlantı sorunu oluştu. Lütfen sayfayı yenileyin. Sorun devam ederse yöneticinize bildirin.</p>
+      </div>
+    );
+  }
 
   async function signOut() {
     await supabase.auth.signOut();
@@ -2489,6 +2503,7 @@ function StaffModal({ initial, onClose, onSave }) {
     try {
       const res = await fetch("/api/invite-staff", {
         method: "POST",
+        credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email.trim(), name: name.trim(), role: makeAdmin ? "owner" : "pt" }),
       });

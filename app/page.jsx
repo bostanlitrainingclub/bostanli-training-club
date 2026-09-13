@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import { createClient } from "../lib/supabase/server";
+import { createAdminClient } from "../lib/supabase/admin";
 import GymApp from "../components/GymApp";
 
 export default async function HomePage() {
@@ -10,7 +11,11 @@ export default async function HomePage() {
     redirect("/login");
   }
 
-  const { data: myStaff } = await supabase
+  // Uses the admin client (bypasses Row Level Security) for this one lookup —
+  // `user` is already a verified, authenticated account at this point, so this
+  // read isn't a security boundary, just reliably fetching their own role/name.
+  const admin = createAdminClient();
+  const { data: myStaff } = await admin
     .from("staff")
     .select("*")
     .eq("auth_user_id", user.id)

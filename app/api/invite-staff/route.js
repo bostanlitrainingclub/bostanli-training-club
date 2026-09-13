@@ -11,13 +11,22 @@ export async function POST(request) {
   if (!user) {
     return NextResponse.json({ error: "Giriş yapmanız gerekiyor." }, { status: 401 });
   }
-  const { data: callerStaff } = await supabase
+  const { data: callerStaff, error: callerError } = await supabase
     .from("staff")
     .select("role")
     .eq("auth_user_id", user.id)
     .maybeSingle();
-  if (!callerStaff || callerStaff.role !== "owner") {
-    return NextResponse.json({ error: "Bu işlem için admin yetkisi gerekiyor." }, { status: 403 });
+
+  if (callerError) {
+    // Temporary: surface the real database error instead of a generic message,
+    // so we can see exactly what's going wrong.
+    return NextResponse.json({ error: "DB hatası (yetki kontrolü): " + callerError.message }, { status: 500 });
+  }
+  if (!callerStaff) {
+    return NextResponse.json({ error: `Bu hesaba bağlı bir antrenör kaydı bulunamadı (auth_user_id: ${user.id}).` }, { status: 403 });
+  }
+  if (callerStaff.role !== "owner") {
+    return NextResponse.json({ error: `Bu hesabın rolü '${callerStaff.role}', admin değil.` }, { status: 403 });
   }
 
   const { email, name, role } = await request.json();

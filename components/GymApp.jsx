@@ -4,7 +4,7 @@ import { useState, useEffect, useMemo, useRef } from "react";
 import {
   Users, Calendar, Wallet, LayoutDashboard, Plus, X, AlertTriangle,
   CheckCircle2, Clock, ChevronLeft, ChevronRight, Search, Trash2, Pencil, Dumbbell, TrendingUp, ListChecks,
-  Download, Upload, LogOut, Mail
+  Download, Upload, LogOut, Mail, Menu
 } from "lucide-react";
 import { createClient as createSupabaseBrowserClient } from "../lib/supabase/client";
 import {
@@ -255,6 +255,18 @@ function refundPackageSession(customer, type) {
    STORAGE — shared across everyone who opens this app, so PTs and
    the owner see the same live data.
 ------------------------------------------------------------------*/
+function useIsMobile(breakpoint = 860) {
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${breakpoint}px)`);
+    const update = () => setIsMobile(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, [breakpoint]);
+  return isMobile;
+}
+
 /* ---------------------------------------------------------------
    ROOT APP
 ------------------------------------------------------------------*/
@@ -264,6 +276,8 @@ export default function GymApp({ myStaffId, myRole, myName }) {
   const role = myRole; // 'owner' | 'pt' — now comes from a real, verified login
   const currentPtId = myStaffId;
   const [tab, setTab] = useState("dashboard");
+  const isMobile = useIsMobile();
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const supabase = useMemo(() => createSupabaseBrowserClient(), []);
 
   const [customers, setCustomers] = useState([]);
@@ -415,9 +429,35 @@ export default function GymApp({ myStaffId, myRole, myName }) {
   }
 
   return (
-    <div style={styles.app}>
+    <div style={{ ...styles.app, flexDirection: isMobile ? "column" : "row", minHeight: isMobile ? "100vh" : styles.app.minHeight }}>
       <style>{globalCss}</style>
-      <aside style={styles.sidebar}>
+
+      {isMobile && (
+        <div style={styles.mobileTopBar}>
+          <button onClick={() => setMobileMenuOpen(true)} style={styles.hamburgerBtn} aria-label="Menü">
+            <Menu size={22} color="#fff" />
+          </button>
+          <img src={LOGO_WHITE} alt="Bostanlı Training Club" style={{ height: 26 }} />
+          <div style={{ width: 38 }} />
+        </div>
+      )}
+
+      {isMobile && mobileMenuOpen && (
+        <div style={styles.mobileBackdrop} onClick={() => setMobileMenuOpen(false)} />
+      )}
+
+      <aside
+        style={
+          isMobile
+            ? { ...styles.sidebar, ...styles.sidebarMobile, transform: mobileMenuOpen ? "translateX(0)" : "translateX(-100%)" }
+            : styles.sidebar
+        }
+      >
+        {isMobile && (
+          <button onClick={() => setMobileMenuOpen(false)} style={styles.mobileCloseBtn} aria-label="Kapat">
+            <X size={20} color="#fff" />
+          </button>
+        )}
         <div style={styles.brand}>
           <img src={LOGO_WHITE} alt="Bostanlı Training Club" style={styles.brandLogo} />
         </div>
@@ -428,7 +468,7 @@ export default function GymApp({ myStaffId, myRole, myName }) {
             return (
               <button
                 key={t.id}
-                onClick={() => setTab(t.id)}
+                onClick={() => { setTab(t.id); if (isMobile) setMobileMenuOpen(false); }}
                 style={{ ...styles.navItem, ...(active ? styles.navItemActive : {}) }}
               >
                 <Icon size={17} strokeWidth={2} />
@@ -472,7 +512,7 @@ export default function GymApp({ myStaffId, myRole, myName }) {
         )}
       </aside>
 
-      <main style={styles.main}>
+      <main style={isMobile ? { ...styles.main, padding: "16px 14px", marginTop: 52 } : styles.main}>
         {tab === "dashboard" && (
           <Dashboard
             customers={customers} sessions={sessions} staff={staff} role={role}
@@ -948,7 +988,7 @@ function CustomerModal({ initial, onClose, onSave, sessions, staff }) {
   return (
     <Modal title={initial ? "Üyeyi düzenle" : "Yeni üye"} onClose={onClose}>
       <Field label="Ad Soyad"><input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} /></Field>
-      <div style={styles.fieldRow}>
+      <div style={styles.fieldRow} className="responsive-row">
         <Field label="Telefon"><input style={styles.input} value={phone} onChange={(e) => setPhone(e.target.value)} /></Field>
         <Field label="E-posta"><input style={styles.input} value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
       </div>
@@ -1011,7 +1051,7 @@ function CustomerModal({ initial, onClose, onSave, sessions, staff }) {
                 <button style={styles.iconBtn} onClick={() => removePackage(p.id)}><Trash2 size={14} /></button>
               </div>
             </div>
-            <div style={styles.fieldRow}>
+            <div style={styles.fieldRow} className="responsive-row">
               <Field label="Seans sayısı">
                 <select style={styles.input} value={p.sessionCount} onChange={(e) => updatePackage(p.id, "sessionCount", Number(e.target.value))}>
                   <option value={8}>8 seanslık paket</option>
@@ -1022,7 +1062,7 @@ function CustomerModal({ initial, onClose, onSave, sessions, staff }) {
                 <input type="number" min="0" style={styles.input} value={p.sessionsUsed} onChange={(e) => updatePackage(p.id, "sessionsUsed", e.target.value)} />
               </Field>
             </div>
-            <div style={styles.fieldRow}>
+            <div style={styles.fieldRow} className="responsive-row">
               <Field label="Satın alma tarihi">
                 <input type="date" style={styles.input} value={p.purchaseDate || ""} onChange={(e) => updatePackage(p.id, "purchaseDate", e.target.value)} />
               </Field>
@@ -1404,7 +1444,7 @@ function SessionDetailModal({ session, sessions, staff, customers, onClose, onMa
 
       {editing && (
         <div style={{ ...styles.packageRow, marginBottom: 16 }}>
-          <div style={styles.fieldRow}>
+          <div style={styles.fieldRow} className="responsive-row">
             <Field label="Başlangıç saati">
               <HourAwareTimeInput type={session.type} value={editStartTime} onChange={setEditStartTime} />
             </Field>
@@ -1988,7 +2028,7 @@ function BookSessionModal({ date, initial, sessions, staff, customers, onClose, 
         </Field>
       )}
 
-      <div style={styles.fieldRow}>
+      <div style={styles.fieldRow} className="responsive-row">
         <Field label="Başlangıç saati">
           <HourAwareTimeInput type={type} value={startTime} onChange={(v) => { setStartTime(v); setErrors([]); }} />
         </Field>
@@ -2109,7 +2149,7 @@ function BookSessionModal({ date, initial, sessions, staff, customers, onClose, 
                     <span style={{ fontSize: 12, color: "var(--muted)" }}>({p.sessionsUsed}/{p.sessionCount})</span>
                   </label>
                   {sel.enabled && (
-                    <div style={styles.fieldRow}>
+                    <div style={styles.fieldRow} className="responsive-row">
                       <Field label="Tarih">
                         <input type="date" style={styles.input} value={sel.date} onChange={(e) => updateOtherPkg(p.type, "date", e.target.value)} />
                       </Field>
@@ -3042,6 +3082,10 @@ const globalCss = `
   input, select, button { font-family: var(--font-body); }
   input:focus, select:focus { outline: 2px solid var(--brand); outline-offset: 1px; }
   button:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+  @media (max-width: 480px) {
+    .responsive-row { flex-direction: column !important; }
+    input, select, textarea { font-size: 16px !important; }
+  }
 `;
 
 const styles = {
@@ -3055,6 +3099,18 @@ const styles = {
     width: 200, background: "var(--ink)", color: "#fff", display: "flex", flexDirection: "column",
     padding: "20px 14px", flexShrink: 0,
   },
+  sidebarMobile: {
+    position: "fixed", top: 0, left: 0, bottom: 0, width: "78vw", maxWidth: 280, zIndex: 60,
+    overflowY: "auto", transition: "transform 0.22s ease", boxShadow: "4px 0 24px rgba(0,0,0,0.25)",
+  },
+  mobileTopBar: {
+    position: "fixed", top: 0, left: 0, right: 0, height: 52, zIndex: 50,
+    background: "var(--ink)", display: "flex", alignItems: "center", justifyContent: "space-between",
+    padding: "0 12px",
+  },
+  hamburgerBtn: { background: "none", border: "none", padding: 6, cursor: "pointer", display: "flex" },
+  mobileCloseBtn: { background: "none", border: "none", padding: 4, cursor: "pointer", position: "absolute", top: 14, right: 12 },
+  mobileBackdrop: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 55 },
   brand: { display: "flex", alignItems: "center", marginBottom: 30, padding: "4px 4px 14px 4px", borderBottom: "1px solid rgba(255,255,255,0.12)" },
   brandLogo: { width: "100%", maxWidth: 168, height: "auto", display: "block" },
   nav: { display: "flex", flexDirection: "column", gap: 2, flex: 1 },

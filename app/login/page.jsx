@@ -97,13 +97,13 @@ export default function LoginPage() {
 }
 
 const styles = {
-  page: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#F3F5F1", fontFamily: "Inter, system-ui, sans-serif" },
-  card: { width: 360, background: "#fff", borderRadius: 14, padding: "32px 28px", boxShadow: "0 10px 40px rgba(0,0,0,0.08)" },
-  title: { fontFamily: "Oswald, sans-serif", fontSize: 22, margin: "0 0 4px 0", color: "#161616" },
+  page: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#F3F5F1", fontFamily: "Inter, system-ui, sans-serif", padding: "24px 16px" },
+  card: { width: "100%", maxWidth: 360, background: "#fff", borderRadius: 14, padding: "28px 24px", boxShadow: "0 10px 40px rgba(0,0,0,0.08)" },
+  title: { fontFamily: "Oswald, sans-serif", fontSize: 20, margin: "0 0 4px 0", color: "#161616" },
   subtitle: { fontSize: 13.5, color: "#68766D", margin: "0 0 22px 0" },
   form: { display: "flex", flexDirection: "column", gap: 6 },
   label: { fontSize: 12.5, fontWeight: 600, color: "#68766D", marginTop: 8 },
-  input: { border: "1px solid #DEE3DA", borderRadius: 8, padding: "10px 12px", fontSize: 14 },
-  button: { marginTop: 18, background: "#171717", color: "#fff", border: "none", borderRadius: 8, padding: "11px 0", fontSize: 14, fontWeight: 600, cursor: "pointer" },
+  input: { border: "1px solid #DEE3DA", borderRadius: 8, padding: "10px 12px", fontSize: 16 },
+  button: { marginTop: 18, background: "#171717", color: "#fff", border: "none", borderRadius: 8, padding: "12px 0", fontSize: 14, fontWeight: 600, cursor: "pointer" },
   error: { fontSize: 12.5, color: "#C1443C", marginTop: 4 },
 };

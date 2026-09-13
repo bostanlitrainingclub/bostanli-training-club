@@ -2459,6 +2459,8 @@ function StaffModal({ initial, onClose, onSave }) {
   const [name, setName] = useState(initial?.name || "");
   const [email, setEmail] = useState("");
   const [makeAdmin, setMakeAdmin] = useState(false);
+  const [accountMode, setAccountMode] = useState("password"); // 'password' | 'invite'
+  const [password, setPassword] = useState("");
   const [saving, setSaving] = useState(false);
   const [availability, setAvailability] = useState(normalizeAvailability(initial?.availability));
   const [preferredPtRow, setPreferredPtRow] = useState(initial?.preferredPtRow ?? "");
@@ -2511,23 +2513,30 @@ function StaffModal({ initial, onClose, onSave }) {
       return;
     }
     if (!email.trim()) return;
+    if (accountMode === "password" && password.length < 8) {
+      alert("Şifre en az 8 karakter olmalı.");
+      return;
+    }
     setSaving(true);
     try {
       const res = await fetch("/api/invite-staff", {
         method: "POST",
         credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: email.trim(), name: name.trim(), role: makeAdmin ? "owner" : "pt" }),
+        body: JSON.stringify({
+          email: email.trim(), name: name.trim(), role: makeAdmin ? "owner" : "pt",
+          password: accountMode === "password" ? password : undefined,
+        }),
       });
       const result = await res.json();
       if (!res.ok) {
-        alert(result.error || "Davet gönderilirken bir sorun oluştu.");
+        alert(result.error || "İşlem sırasında bir sorun oluştu.");
         setSaving(false);
         return;
       }
       onSave({ ...payload, id: result.staffId, _dbRole: makeAdmin ? "owner" : "pt" });
     } catch (err) {
-      alert("Davet gönderilemedi: " + err.message);
+      alert("İşlem başarısız: " + err.message);
       setSaving(false);
     }
   }
@@ -2559,10 +2568,52 @@ function StaffModal({ initial, onClose, onSave }) {
             <input type="checkbox" checked={makeAdmin} onChange={(e) => setMakeAdmin(e.target.checked)} />
             <span style={{ fontSize: 13.5 }}>Bu kişi admin olsun</span>
           </label>
-          <div style={{ fontSize: 12, color: "var(--muted)", marginTop: -10, marginBottom: 16 }}>
-            <Mail size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
-            Kaydettiğinizde bu adrese şifre belirleme daveti gönderilecek.
+
+          <div style={styles.fieldLabel}>Hesap nasıl oluşturulsun?</div>
+          <div style={{ ...styles.typeSelectRow, marginTop: 6, marginBottom: 12 }}>
+            <button
+              onClick={() => setAccountMode("password")}
+              style={{
+                ...styles.typeChip,
+                borderColor: accountMode === "password" ? "var(--brand)" : "var(--border)",
+                background: accountMode === "password" ? "rgba(0,0,0,0.06)" : "transparent",
+              }}
+            >
+              Şifreyi ben belirleyeyim
+            </button>
+            <button
+              onClick={() => setAccountMode("invite")}
+              style={{
+                ...styles.typeChip,
+                borderColor: accountMode === "invite" ? "var(--brand)" : "var(--border)",
+                background: accountMode === "invite" ? "rgba(0,0,0,0.06)" : "transparent",
+              }}
+            >
+              E-posta ile davet gönder
+            </button>
           </div>
+
+          {accountMode === "password" ? (
+            <>
+              <Field label="Şifre (en az 8 karakter)">
+                <input
+                  type="text"
+                  style={styles.input}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Bu şifreyi kendiniz belirleyip kişiye iletin"
+                />
+              </Field>
+              <div style={{ fontSize: 12, color: "var(--muted)", marginTop: -10, marginBottom: 16 }}>
+                Hesap hemen aktif olur — e-posta beklemeye gerek yok. Şifreyi kişiye siz iletirsiniz.
+              </div>
+            </>
+          ) : (
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: -10, marginBottom: 16 }}>
+              <Mail size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
+              Kaydettiğinizde bu adrese şifre belirleme daveti gönderilecek.
+            </div>
+          )}
         </>
       )}
 

@@ -1055,6 +1055,7 @@ function CustomerModal({ initial, onClose, onSave, sessions, staff }) {
               <Field label="Seans sayısı">
                 <select style={styles.input} value={p.sessionCount} onChange={(e) => updatePackage(p.id, "sessionCount", Number(e.target.value))}>
                   <option value={8}>8 seanslık paket</option>
+                  <option value={10}>10 seanslık paket</option>
                   <option value={12}>12 seanslık paket</option>
                 </select>
               </Field>

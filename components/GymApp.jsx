@@ -4,7 +4,7 @@ import { useState, useEffect, useMemo, useRef } from "react";
 import {
   Users, Calendar, Wallet, LayoutDashboard, Plus, X, AlertTriangle,
   CheckCircle2, Clock, ChevronLeft, ChevronRight, Search, Trash2, Pencil, Dumbbell, TrendingUp, ListChecks,
-  Download, Upload, LogOut, Mail, Menu
+  Download, Upload, LogOut, Mail, Menu, MessageCircle, Printer, Copy, FileText
 } from "lucide-react";
 import { createClient as createSupabaseBrowserClient } from "../lib/supabase/client";
 import {
@@ -413,6 +413,7 @@ export default function GymApp({ myStaffId, myRole, myName }) {
     { id: "customers", label: "Üyeler", icon: Users },
     { id: "schedule", label: "Program", icon: Calendar },
     ...(role === "owner" ? [{ id: "staff", label: "Antrenörler", icon: Dumbbell }] : []),
+    ...(role === "owner" ? [{ id: "weekly", label: "Haftalık Rapor", icon: FileText }] : []),
     ...(role === "owner" ? [{ id: "groupClasses", label: "Grup Dersleri", icon: ListChecks }] : []),
     ...(role === "owner" ? [{ id: "payments", label: "Ödemeler", icon: Wallet }] : []),
     ...(role === "owner" ? [{ id: "reports", label: "Finansal Raporlar", icon: TrendingUp }] : []),
@@ -539,6 +540,9 @@ export default function GymApp({ myStaffId, myRole, myName }) {
             commissionRates={commissionRates} setCommissionRates={setCommissionRates}
             currentPtId={currentPtId}
           />
+        )}
+        {tab === "weekly" && role === "owner" && (
+          <WeeklyReportTab sessions={sessions} staff={staff} customers={customers} />
         )}
         {tab === "groupClasses" && role === "owner" && (
           <GroupClassesTab groupClasses={groupClasses} setGroupClasses={setGroupClasses} sessions={sessions} />
@@ -2365,6 +2369,154 @@ function FinancialReportsTab({ customers, sessions, staff, commissionRates }) {
 /* ---------------------------------------------------------------
    HOCALAR (STAFF)
 ------------------------------------------------------------------*/
+
+/* ------------------------------------------------------------------
+   HAFTALIK RAPOR — one card per trainer with that trainer's week,
+   ready to send over WhatsApp Web (message pre-filled, owner presses Send).
+------------------------------------------------------------------- */
+const mondayOf = (dateStr) => {
+  const d = new Date(dateStr + "T00:00:00");
+  return addDays(dateStr, -((d.getDay() + 6) % 7));
+};
+const waPhone = (raw) => {
+  let d = String(raw || "").replace(/\D/g, "");
+  if (!d) return "";
+  if (d.startsWith("00")) d = d.slice(2);
+  if (d.startsWith("90") && d.length >= 12) return d;
+  if (d.startsWith("0")) d = d.slice(1);
+  if (d.length === 10) return "90" + d;
+  return d;
+};
+
+function WeeklyReportTab({ sessions, staff, customers }) {
+  const [weekStart, setWeekStart] = useState(() => {
+    const t = todayStr();
+    const wd = (new Date(t + "T00:00:00").getDay() + 6) % 7; // Mon=0
+    return wd >= 4 ? addDays(mondayOf(t), 7) : mondayOf(t); // Fri-Sun -> show next week
+  });
+  const [sentIds, setSentIds] = useState({});
+  const [copiedId, setCopiedId] = useState(null);
+  const weekEnd = addDays(weekStart, 6);
+  const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+  const custName = (id) => customers.find((c) => c.id === id)?.name || "—";
+  const dayLabel = (d) =>
+    new Date(d + "T00:00:00").toLocaleDateString("tr-TR", { weekday: "long", day: "numeric", month: "long" });
+  const rangeLabel = `${new Date(weekStart + "T00:00:00").toLocaleDateString("tr-TR", { day: "numeric", month: "long" })} – ${new Date(weekEnd + "T00:00:00").toLocaleDateString("tr-TR", { day: "numeric", month: "long" })}`;
+
+  function lineFor(s) {
+    const end = minToTime(timeToMin(s.startTime) + (s.durationMin || 60));
+    const people = (s.customerIds || []).map(custName);
+    let who = "";
+    if (s.type === "group" || s.type === "pilates") {
+      who = people.length ? ` (${people.length} kişi: ${people.join(", ")})` : "";
+    } else {
+      who = people.length ? ` – ${people.join(", ")}` : "";
+    }
+    return `${s.startTime}–${end}  ${sessionLabel(s)}${who}`;
+  }
+
+  const reports = staff
+    .map((t) => {
+      const mine = sessions
+        .filter((s) => s.ptId === t.id && s.date >= weekStart && s.date <= weekEnd)
+        .sort((a, b) => (a.date === b.date ? timeToMin(a.startTime) - timeToMin(b.startTime) : a.date < b.date ? -1 : 1));
+      const byDay = days.map((d) => ({ date: d, items: mine.filter((s) => s.date === d) })).filter((x) => x.items.length);
+      const first = (t.name || "").split(" ")[0];
+      let text = `Merhaba ${first}, Bostanlı Training Club ${rangeLabel} haftalık programın:\n`;
+      if (!mine.length) {
+        text += "\nBu hafta için planlı seansın görünmüyor.";
+      } else {
+        byDay.forEach((x) => {
+          text += `\n*${dayLabel(x.date)}*\n` + x.items.map(lineFor).join("\n") + "\n";
+        });
+        text += `\nToplam ${mine.length} seans. İyi çalışmalar!`;
+      }
+      return { trainer: t, count: mine.length, byDay, text };
+    })
+    .sort((a, b) => b.count - a.count);
+
+  function sendWhatsApp(r) {
+    const phone = waPhone(r.trainer.phone);
+    if (!phone) return;
+    // Same named window each time -> reuses your open WhatsApp Web tab instead of piling up new ones.
+    window.open(`https://web.whatsapp.com/send?phone=${phone}&text=${encodeURIComponent(r.text)}`, "whatsapp_web");
+    setSentIds((p) => ({ ...p, [r.trainer.id]: true }));
+  }
+  async function copyText(r) {
+    try { await navigator.clipboard.writeText(r.text); } catch (e) { /* ignore */ }
+    setCopiedId(r.trainer.id);
+    setTimeout(() => setCopiedId(null), 1800);
+  }
+  function printAll() {
+    const esc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/\*/g, "");
+    const html = `<html><head><title>Haftalık Program ${rangeLabel}</title><style>body{font-family:Arial,sans-serif;padding:24px}h2{margin:0 0 6px}pre{font-family:inherit;white-space:pre-wrap;margin:0 0 22px;padding-bottom:16px;border-bottom:1px solid #ccc;page-break-inside:avoid}</style></head><body><h1>Bostanlı Training Club — ${rangeLabel}</h1>${reports.map((r) => `<h2>${esc(r.trainer.name)}</h2><pre>${esc(r.text)}</pre>`).join("")}</body></html>`;
+    const w = window.open("", "_blank");
+    if (!w) return;
+    w.document.write(html);
+    w.document.close();
+    w.focus();
+    w.print();
+  }
+
+  return (
+    <div>
+      <PageHeader
+        eyebrow="Antrenör bazlı"
+        title="Haftalık Rapor"
+        action={<button style={styles.primaryBtn} onClick={printAll}><Printer size={15} /> Yazdır / PDF</button>}
+      />
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+        <button style={styles.secondaryBtnSm} onClick={() => setWeekStart(addDays(weekStart, -7))}><ChevronLeft size={15} /></button>
+        <div style={{ fontWeight: 600, minWidth: 190, textAlign: "center" }}>{rangeLabel}</div>
+        <button style={styles.secondaryBtnSm} onClick={() => setWeekStart(addDays(weekStart, 7))}><ChevronRight size={15} /></button>
+      </div>
+
+      <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 16 }}>
+        “WhatsApp’ta aç”ya basınca açık WhatsApp Web sekmenizde mesaj hazır gelir; sadece Gönder’e basmanız yeterli.
+      </div>
+
+      {reports.length === 0 && <EmptyState text="Henüz antrenör yok." />}
+
+      <div style={{ display: "grid", gap: 14 }}>
+        {reports.map((r) => {
+          const hasPhone = !!waPhone(r.trainer.phone);
+          return (
+            <div key={r.trainer.id} style={styles.card}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+                <div style={{ fontWeight: 700, fontSize: 16 }}>{r.trainer.name}</div>
+                <Pill>{r.count} seans</Pill>
+                {sentIds[r.trainer.id] && <Pill tone="ok">Açıldı ✓</Pill>}
+                <div style={{ marginLeft: "auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <button style={styles.secondaryBtnSm} onClick={() => copyText(r)}>
+                    <Copy size={14} /> {copiedId === r.trainer.id ? "Kopyalandı" : "Kopyala"}
+                  </button>
+                  <button
+                    style={{ ...styles.primaryBtn, opacity: hasPhone ? 1 : 0.5, cursor: hasPhone ? "pointer" : "not-allowed" }}
+                    disabled={!hasPhone}
+                    onClick={() => sendWhatsApp(r)}
+                    title={hasPhone ? "" : "Antrenörler sekmesinden telefon numarası ekleyin"}
+                  >
+                    <MessageCircle size={15} /> WhatsApp’ta aç
+                  </button>
+                </div>
+              </div>
+              {!hasPhone && (
+                <div style={{ fontSize: 12.5, color: "var(--danger, #C1443C)", marginBottom: 8 }}>
+                  Telefon numarası yok — Antrenörler sekmesinde düzenleyip ekleyin.
+                </div>
+              )}
+              <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "inherit", fontSize: 13.5, lineHeight: 1.5, background: "var(--bg, #F3F5F1)", borderRadius: 8, padding: 12 }}>
+                {r.text.replace(/\*/g, "")}
+              </pre>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function StaffTab({ staff, setStaff, sessions, customers, commissionRates, setCommissionRates, currentPtId }) {
   const [staffModalTarget, setStaffModalTarget] = useState(null); // null | "new" | trainer object
   const [viewingId, setViewingId] = useState(null);
@@ -2505,6 +2657,7 @@ function StaffModal({ initial, onClose, onSave }) {
   const [saving, setSaving] = useState(false);
   const [availability, setAvailability] = useState(normalizeAvailability(initial?.availability));
   const [preferredPtRow, setPreferredPtRow] = useState(initial?.preferredPtRow ?? "");
+  const [phone, setPhone] = useState(initial?.phone || "");
 
   function toggleDayOn(wd) {
     setAvailability((prev) => ({ ...prev, [wd]: { ...prev[wd], on: !prev[wd].on } }));
@@ -2547,7 +2700,7 @@ function StaffModal({ initial, onClose, onSave }) {
   }
   async function handleSave() {
     if (!name.trim()) return;
-    const payload = { name: name.trim(), availability, preferredPtRow: preferredPtRow === "" ? null : Number(preferredPtRow) };
+    const payload = { name: name.trim(), phone: phone.trim(), availability, preferredPtRow: preferredPtRow === "" ? null : Number(preferredPtRow) };
     if (initial) {
       // Editing an existing trainer's schedule details doesn't touch their login.
       onSave(payload);
@@ -2592,6 +2745,10 @@ function StaffModal({ initial, onClose, onSave }) {
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") handleSave(); }}
         />
+      </Field>
+
+      <Field label="Telefon (WhatsApp için, örn. 0532 123 45 67)">
+        <input style={styles.input} type="tel" inputMode="tel" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="05xx xxx xx xx" />
       </Field>
 
       {!initial && (

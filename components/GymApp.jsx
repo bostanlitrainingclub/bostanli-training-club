@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import {
   Users, Calendar, Wallet, LayoutDashboard, Plus, X, AlertTriangle,
   CheckCircle2, Clock, ChevronLeft, ChevronRight, Search, Trash2, Pencil, Dumbbell, TrendingUp, ListChecks,
@@ -8,7 +8,7 @@ import {
 } from "lucide-react";
 import { createClient as createSupabaseBrowserClient } from "../lib/supabase/client";
 import {
-  loadAll, syncTable, syncCommissionRates,
+  loadAll, syncTable, syncCommissionRates, sessionFromRow,
   customerToRow, staffToRow, sessionToRow, groupClassToRow,
 } from "../lib/data";
 
@@ -68,6 +68,10 @@ const toDateStr = (d) => {
   return `${y}-${m}-${day}`;
 };
 const todayStr = () => toDateStr(new Date());
+// Lessons imported from a trainer's Google Calendar carry this id prefix. The server owns
+// their date/time; the app only saves who attended / which member they belong to.
+const isExternalSession = (s) => String((s && s.id) || "").startsWith("gcal_");
+const extSig = (s) => JSON.stringify([s.customerIds || [], s.customerNames || "", s.attendance || {}, !!s.reviewed]);
 const addDays = (dateStr, n) => {
   const d = new Date(dateStr + "T00:00:00");
   d.setDate(d.getDate() + n);
@@ -288,7 +292,7 @@ export default function GymApp({ myStaffId, myRole, myName }) {
 
   // Tracks the last state we actually wrote to the database, so the sync effects
   // below only send the rows that changed instead of re-writing everything.
-  const prevRef = useRef({ customers: [], staff: [], sessions: [], groupClasses: [], commissionRates: {} });
+  const prevRef = useRef({ customers: [], staff: [], sessions: [], groupClasses: [], commissionRates: {}, ext: {} });
 
   useEffect(() => {
     (async () => {
@@ -299,7 +303,11 @@ export default function GymApp({ myStaffId, myRole, myName }) {
         setSessions(data.sessions);
         setCommissionRates(data.commissionRates);
         setGroupClasses(data.groupClasses);
-        prevRef.current = data;
+        prevRef.current = {
+          ...data,
+          sessions: data.sessions.filter((x) => !isExternalSession(x)),
+          ext: Object.fromEntries(data.sessions.filter(isExternalSession).map((x) => [x.id, extSig(x)])),
+        };
         setReady(true);
       } catch (err) {
         console.error("Failed to load data from Supabase:", err);
@@ -323,9 +331,57 @@ export default function GymApp({ myStaffId, myRole, myName }) {
   }, [staff, ready, supabase]);
   useEffect(() => {
     if (!ready) return;
-    syncTable(supabase, "sessions", prevRef.current.sessions, sessions, sessionToRow);
-    prevRef.current.sessions = sessions;
+    // Imported Google Calendar lessons are kept out of the normal save loop (the server owns
+    // them); only member links and attendance on those get written back.
+    const real = sessions.filter((x) => !isExternalSession(x));
+    syncTable(supabase, "sessions", prevRef.current.sessions, real, sessionToRow);
+    prevRef.current.sessions = real;
+    sessions.filter(isExternalSession).forEach((x) => {
+      const sig = extSig(x);
+      if (prevRef.current.ext[x.id] === sig) return;
+      prevRef.current.ext[x.id] = sig;
+      supabase.from("sessions").update({
+        customer_ids: x.customerIds || [], customer_names: x.customerNames || null,
+        attendance: x.attendance || {}, reviewed: !!x.reviewed,
+      }).eq("id", x.id).then(({ error }) => { if (error) console.error("Sync error updating imported session:", error); });
+    });
   }, [sessions, ready, supabase]);
+
+  // Pull in lessons from trainers' Google Calendars (the server fetches + throttles), then
+  // merge them into the schedule without touching attendance the user has already recorded.
+  const refreshExternal = useCallback(async () => {
+    try {
+      await fetch("/api/sync-calendars", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const { data, error } = await supabase.from("sessions").select("*").like("id", "gcal\\_%");
+      if (error || !data) return;
+      const fresh = data.map(sessionFromRow);
+      setSessions((prev) => {
+        const local = new Map(prev.filter(isExternalSession).map((x) => [x.id, x]));
+        const merged = fresh.map((f) => {
+          const l = local.get(f.id);
+          if (!l) { prevRef.current.ext[f.id] = extSig(f); return f; }
+          const takeFreshMember = (l.customerIds || []).length === 0 && (f.customerIds || []).length > 0;
+          const out = {
+            ...f,
+            customerIds: takeFreshMember ? f.customerIds : l.customerIds,
+            customerNames: takeFreshMember ? f.customerNames : l.customerNames,
+            attendance: l.attendance, reviewed: l.reviewed,
+          };
+          if (takeFreshMember) prevRef.current.ext[f.id] = extSig(out);
+          return out;
+        });
+        return [...prev.filter((x) => !isExternalSession(x)), ...merged];
+      });
+    } catch (e) { /* offline or not configured — try again next time */ }
+  }, [supabase]);
+  useEffect(() => {
+    if (!ready) return;
+    refreshExternal();
+    const timer = setInterval(refreshExternal, 4 * 60 * 1000);
+    const onVisible = () => { if (document.visibilityState === "visible") refreshExternal(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
+  }, [ready, refreshExternal]);
   useEffect(() => {
     if (!ready) return;
     syncTable(supabase, "group_classes", prevRef.current.groupClasses, groupClasses, groupClassToRow);
@@ -1270,7 +1326,18 @@ function ScheduleTab({ sessions, setSessions, staff, customers, onMarkAttendance
   const [ptFilter, setPtFilter] = useState("");
   const selectedSession = sessions.find((s) => s.id === selectedId) || null;
   // A PT can see the whole floor, but can only book/edit/delete their own sessions.
-  const canEdit = (s) => role === "owner" || (currentPtId && s.ptId === currentPtId);
+  const canEdit = (s) => !isExternalSession(s) && (role === "owner" || (currentPtId && s.ptId === currentPtId));
+  // Attendance can be confirmed for imported lessons too; moving/editing/deleting them can't be done here.
+  const canAttend = (s) => role === "owner" || (currentPtId && s.ptId === currentPtId);
+  function assignCustomerToExternal(sessionId, customerId) {
+    const target = sessions.find((x) => x.id === sessionId);
+    const cust = customers.find((c) => c.id === customerId);
+    if (!target || !cust) return;
+    // Applies to every not-yet-assigned lesson from this trainer with the same calendar title.
+    setSessions((prev) => prev.map((x) =>
+      isExternalSession(x) && x.ptId === target.ptId && (x.customerIds || []).length === 0 && x.customerNames === target.customerNames
+        ? { ...x, customerIds: [customerId], customerNames: cust.name } : x));
+  }
 
   function addSessions(list) {
     setSessions((prev) => [
@@ -1398,13 +1465,15 @@ function ScheduleTab({ sessions, setSessions, staff, customers, onMarkAttendance
           setCommissionRates={setCommissionRates}
           role={role}
           canEdit={canEdit(selectedSession)}
+          canAttend={canAttend(selectedSession)}
+          onAssignCustomer={assignCustomerToExternal}
         />
       )}
     </div>
   );
 }
 
-function SessionDetailModal({ session, sessions, staff, customers, onClose, onMarkAttendance, onRemove, onUpdateSeries, commissionRates, setCommissionRates, role, canEdit }) {
+function SessionDetailModal({ session, sessions, staff, customers, onClose, onMarkAttendance, onRemove, onUpdateSeries, commissionRates, setCommissionRates, role, canEdit, canAttend, onAssignCustomer }) {
   const pt = staff.find((p) => p.id === session.ptId);
   const ended = sessionEndMs(session) <= Date.now();
   const type = SESSION_TYPES[session.type];
@@ -1420,7 +1489,7 @@ function SessionDetailModal({ session, sessions, staff, customers, onClose, onMa
   const soloCustomerId = (session.customerIds || []).length === 1 ? session.customerIds[0] : null;
   const relatedSessions = soloCustomerId
     ? sessions.filter((s) =>
-        s.id !== session.id && s.ptId === session.ptId && s.type === session.type &&
+        s.id !== session.id && !isExternalSession(s) && s.ptId === session.ptId && s.type === session.type &&
         (s.customerIds || []).length === 1 && s.customerIds[0] === soloCustomerId &&
         s.date >= session.date
       )
@@ -1445,7 +1514,12 @@ function SessionDetailModal({ session, sessions, staff, customers, onClose, onMa
           <DetailRow label="Ders" value={session.groupClassName} />
         )}
         <DetailRow label={session.type === "pilates" ? "Eğitmen" : "Antrenör"} value={pt ? pt.name : "Atanmadı"} />
+        {isExternalSession(session) && <DetailRow label="Kaynak" value="Google Takvim" />}
       </div>
+
+      {isExternalSession(session) && (session.customerIds || []).length === 0 && canAttend && (
+        <AssignMemberRow title={session.customerNames} customers={customers} onAssign={(cid) => onAssignCustomer(session.id, cid)} />
+      )}
 
       {editing && (
         <div style={{ ...styles.packageRow, marginBottom: 16 }}>
@@ -1498,7 +1572,7 @@ function SessionDetailModal({ session, sessions, staff, customers, onClose, onMa
                 </div>
                 {decided ? (
                   <Pill tone={decided === "attended" ? "ok" : "neutral"}>{decided === "attended" ? "Katıldı" : "Gelmedi"}</Pill>
-                ) : ended && canEdit ? (
+                ) : ended && canAttend ? (
                   <div style={{ display: "flex", gap: 6 }}>
                     <button style={styles.secondaryBtnSm} onClick={() => onMarkAttendance(session.id, cid, "no-show")}>Gelmedi</button>
                     <button style={styles.primaryBtnSm} onClick={() => onMarkAttendance(session.id, cid, "attended")}>
@@ -1547,7 +1621,7 @@ function SessionDetailModal({ session, sessions, staff, customers, onClose, onMa
           </div>
         ) : !editing ? (
           <>
-            {!canEdit && <span style={{ fontSize: 12, color: "var(--muted)", marginRight: "auto" }}>Yalnızca görüntüleme</span>}
+            {!canEdit && <span style={{ fontSize: 12, color: "var(--muted)", marginRight: "auto" }}>{isExternalSession(session) ? "Google Takvim’den geliyor — değişiklik için Google Takvim’i kullanın" : "Yalnızca görüntüleme"}</span>}
             {canEdit && (
               <>
                 <button style={styles.secondaryBtn} onClick={() => { setEditStartTime(session.startTime); setEditDuration(session.durationMin); setEditing(true); }}>
@@ -1566,6 +1640,121 @@ function SessionDetailModal({ session, sessions, staff, customers, onClose, onMa
         ) : null}
       </div>
     </Modal>
+  );
+}
+
+function AssignMemberRow({ title, customers, onAssign }) {
+  const [cid, setCid] = useState("");
+  return (
+    <div style={{ ...styles.packageRow, marginBottom: 16 }}>
+      <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 8 }}>
+        Takvim başlığı “{title}” bir üyeyle eşleşmedi. Üye seçerseniz aynı başlıklı tüm seanslar o üyeye bağlanır.
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <select style={{ ...styles.input, flex: 1 }} value={cid} onChange={(e) => setCid(e.target.value)}>
+          <option value="">Üye seçin…</option>
+          {[...customers].sort((a, b) => a.name.localeCompare(b.name, "tr")).map((c) => (
+            <option key={c.id} value={c.id}>{c.name}</option>
+          ))}
+        </select>
+        <button style={styles.primaryBtnSm} disabled={!cid} onClick={() => cid && onAssign(cid)}>Üyeye ata</button>
+      </div>
+    </div>
+  );
+}
+
+/* Admin-only: connect a trainer's Google Calendar (private iCal address). */
+function CalendarSettings({ staffId }) {
+  const supabase = useMemo(() => createSupabaseBrowserClient(), []);
+  const [loaded, setLoaded] = useState(false);
+  const [url, setUrl] = useState("");
+  const [savedUrl, setSavedUrl] = useState("");
+  const [onlyMatched, setOnlyMatched] = useState(true);
+  const [lastAt, setLastAt] = useState(null);
+  const [report, setReport] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  async function load() {
+    const { data, error } = await supabase.from("staff_calendars").select("*").eq("staff_id", staffId).maybeSingle();
+    if (error) { setMsg("Takvim ayarları okunamadı: " + error.message); setLoaded(true); return; }
+    if (data) {
+      setUrl(data.ical_url || ""); setSavedUrl(data.ical_url || "");
+      setOnlyMatched(data.only_matched !== false);
+      setLastAt(data.last_synced_at); setReport(data.last_report || null);
+    }
+    setLoaded(true);
+  }
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [staffId]);
+
+  async function saveAndSync() {
+    setBusy(true); setMsg("");
+    const u = url.trim();
+    if (!u) {
+      const { error } = await supabase.from("staff_calendars").delete().eq("staff_id", staffId);
+      setMsg(error ? "Kaldırılamadı: " + error.message : "Takvim bağlantısı kaldırıldı. Daha önce alınan seanslar Program’da kalır.");
+      setSavedUrl(""); setLastAt(null); setReport(null); setBusy(false);
+      return;
+    }
+    if (!/^(https:|webcal:)\/\/calendar\.google\.com\//i.test(u)) {
+      setMsg("Bu bir Google Takvim adresi gibi görünmüyor. “iCal biçimindeki gizli adres” kopyalanmalı.");
+      setBusy(false);
+      return;
+    }
+    const changed = u !== savedUrl;
+    const { error } = await supabase.from("staff_calendars").upsert({
+      staff_id: staffId, ical_url: u, only_matched: onlyMatched,
+      ...(changed ? { last_synced_at: null, last_report: null } : {}),
+    });
+    if (error) { setMsg("Kaydedilemedi: " + error.message); setBusy(false); return; }
+    try {
+      const res = await fetch("/api/sync-calendars", {
+        method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: true, staffId }),
+      });
+      if (!res.ok) { const j = await res.json().catch(() => ({})); setMsg(j.error || "Eşitleme başarısız."); }
+      else setMsg("Kaydedildi ve eşitlendi. Program’da görmek için sayfayı yenileyin.");
+    } catch (e) { setMsg("Eşitleme başarısız: " + e.message); }
+    await load();
+    setBusy(false);
+  }
+
+  return (
+    <div style={{ ...styles.packageRow, marginTop: 6, marginBottom: 14 }}>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>Google Takvim bağlantısı</div>
+      <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8, lineHeight: 1.5 }}>
+        Antrenör seanslarını Google Takvim’de tutuyorsa buraya takviminin <b>iCal biçimindeki gizli adresini</b> yapıştırın
+        (Google Takvim → Ayarlar → takvimin adı → “Takvimi entegre et” → “iCal biçimindeki gizli adres”).
+        Etkinlik başlığında üyenin ad soyadı olmalı (örn. “PT – Ayşe Yılmaz”). Kişisel etkinlikler için ayrı bir “Dersler” takvimi kullanması önerilir.
+      </div>
+      {!loaded ? <div style={{ fontSize: 12.5 }}>Yükleniyor…</div> : (
+        <>
+          <input style={styles.input} value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://calendar.google.com/calendar/ical/…/basic.ics" />
+          <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12.5, marginTop: 8 }}>
+            <input type="checkbox" checked={onlyMatched} onChange={(e) => setOnlyMatched(e.target.checked)} />
+            Sadece başlığı bir üyeyle eşleşen etkinlikleri al (önerilir)
+          </label>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 10, flexWrap: "wrap" }}>
+            <button type="button" style={styles.primaryBtnSm} disabled={busy} onClick={saveAndSync}>
+              {busy ? "Eşitleniyor…" : url.trim() ? "Kaydet ve şimdi eşitle" : "Bağlantıyı kaldır"}
+            </button>
+            {lastAt && <span style={{ fontSize: 12, color: "var(--muted)" }}>Son eşitleme: {new Date(lastAt).toLocaleString("tr-TR")}</span>}
+          </div>
+          {msg && <div style={{ fontSize: 12.5, marginTop: 8 }}>{msg}</div>}
+          {report && report.ok === false && (
+            <div style={{ fontSize: 12.5, marginTop: 8, color: "#A6332B" }}>Hata: {report.error}</div>
+          )}
+          {report && report.ok && (
+            <div style={{ fontSize: 12.5, marginTop: 8, color: "var(--muted)", lineHeight: 1.5 }}>
+              {report.total} seans takipte ({report.added} yeni, {report.updated} güncellendi, {report.removed} kaldırıldı).
+              {report.skipped && report.skipped.length > 0 && (
+                <div>Üyeyle eşleşmediği için alınmayanlar: {report.skipped.map((x) => `${x.title} (${x.count})`).join(", ")}</div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 
@@ -2750,6 +2939,8 @@ function StaffModal({ initial, onClose, onSave }) {
       <Field label="Telefon (WhatsApp için, örn. 0532 123 45 67)">
         <input style={styles.input} type="tel" inputMode="tel" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="05xx xxx xx xx" />
       </Field>
+
+      {initial && <CalendarSettings staffId={initial.id} />}
 
       {!initial && (
         <>

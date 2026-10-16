@@ -4,11 +4,11 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import {
   Users, Calendar, Wallet, LayoutDashboard, Plus, X, AlertTriangle,
   CheckCircle2, Clock, ChevronLeft, ChevronRight, Search, Trash2, Pencil, Dumbbell, TrendingUp, ListChecks,
-  Download, Upload, LogOut, Mail, Menu, MessageCircle, Printer, Copy, FileText, Receipt
+  Download, Upload, LogOut, Mail, Menu, MessageCircle, Printer, Copy, FileText, Receipt, PhoneCall
 } from "lucide-react";
 import { createClient as createSupabaseBrowserClient } from "../lib/supabase/client";
 import {
-  loadAll, syncTable, syncCommissionRates, sessionFromRow,
+  loadAll, syncTable, syncCommissionRates, sessionFromRow, loadLeads, leadToRow,
   customerToRow, staffToRow, sessionToRow, groupClassToRow,
 } from "../lib/data";
 
@@ -329,10 +329,12 @@ export default function GymApp({ myStaffId, myRole, myName }) {
   const [sessions, setSessions] = useState([]);
   const [commissionRates, setCommissionRates] = useState({});
   const [groupClasses, setGroupClasses] = useState([]);
+  const [leads, setLeads] = useState([]);
+  const [leadsReady, setLeadsReady] = useState(false); // false until the leads table loaded OK (so we never overwrite it blindly)
 
   // Tracks the last state we actually wrote to the database, so the sync effects
   // below only send the rows that changed instead of re-writing everything.
-  const prevRef = useRef({ customers: [], staff: [], sessions: [], groupClasses: [], commissionRates: {}, ext: {} });
+  const prevRef = useRef({ customers: [], staff: [], sessions: [], groupClasses: [], commissionRates: {}, ext: {}, leads: [] });
 
   useEffect(() => {
     (async () => {
@@ -343,8 +345,12 @@ export default function GymApp({ myStaffId, myRole, myName }) {
         setSessions(data.sessions);
         setCommissionRates(data.commissionRates);
         setGroupClasses(data.groupClasses);
+        const leadsResult = await loadLeads(supabase);
+        setLeads(leadsResult.rows);
+        setLeadsReady(leadsResult.ok);
         prevRef.current = {
           ...data,
+          leads: leadsResult.rows,
           sessions: data.sessions.filter((x) => !isExternalSession(x)),
           ext: Object.fromEntries(data.sessions.filter(isExternalSession).map((x) => [x.id, extSig(x)])),
         };
@@ -428,6 +434,11 @@ export default function GymApp({ myStaffId, myRole, myName }) {
     prevRef.current.groupClasses = groupClasses;
   }, [groupClasses, ready, supabase]);
   useEffect(() => {
+    if (!ready || !leadsReady) return;
+    syncTable(supabase, "leads", prevRef.current.leads, leads, leadToRow);
+    prevRef.current.leads = leads;
+  }, [leads, ready, leadsReady, supabase]);
+  useEffect(() => {
     if (!ready) return;
     syncCommissionRates(supabase, prevRef.current.commissionRates, commissionRates);
     prevRef.current.commissionRates = commissionRates;
@@ -453,7 +464,7 @@ export default function GymApp({ myStaffId, myRole, myName }) {
     const backup = {
       exportedAt: new Date().toISOString(),
       version: 1,
-      customers, staff, sessions, commissionRates, groupClasses,
+      customers, staff, sessions, commissionRates, groupClasses, leads,
     };
     const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -487,6 +498,7 @@ export default function GymApp({ myStaffId, myRole, myName }) {
       setSessions(data.sessions || []);
       setCommissionRates(data.commissionRates || {});
       setGroupClasses(data.groupClasses || []);
+      if (Array.isArray(data.leads) && leadsReady) setLeads(data.leads); // older backups have no leads — leave them alone
     };
     reader.readAsText(file);
   }
@@ -504,9 +516,11 @@ export default function GymApp({ myStaffId, myRole, myName }) {
     }
   }
 
+  const dueLeads = role === "owner" ? leads.filter((l) => isLeadActive(l) && l.followUpDate && l.followUpDate <= todayStr()) : [];
   const tabs = [
     { id: "dashboard", label: "Panel", icon: LayoutDashboard },
     { id: "customers", label: "Üyeler", icon: Users },
+    ...(role === "owner" ? [{ id: "leads", label: "Potansiyel Üyeler", icon: PhoneCall, badge: dueLeads.length }] : []),
     { id: "schedule", label: "Program", icon: Calendar },
     ...(role === "owner" ? [{ id: "staff", label: "Antrenörler", icon: Dumbbell }] : []),
     ...(role === "owner" ? [{ id: "weekly", label: "Haftalık Rapor", icon: FileText }] : []),
@@ -571,6 +585,9 @@ export default function GymApp({ myStaffId, myRole, myName }) {
               >
                 <Icon size={17} strokeWidth={2} />
                 {t.label}
+                {t.badge > 0 && (
+                  <span style={{ marginLeft: "auto", background: "#C1443C", color: "#fff", borderRadius: 99, fontSize: 11, fontWeight: 700, padding: "1px 7px" }}>{t.badge}</span>
+                )}
               </button>
             );
           })}
@@ -615,7 +632,11 @@ export default function GymApp({ myStaffId, myRole, myName }) {
           <Dashboard
             customers={customers} sessions={sessions} staff={staff} role={role}
             onMarkAttendance={markAttendance} setCustomers={setCustomers} currentPtId={currentPtId}
+            dueLeads={dueLeads} onOpenLeads={() => setTab("leads")}
           />
+        )}
+        {tab === "leads" && role === "owner" && (
+          <LeadsTab leads={leads} setLeads={setLeads} setCustomers={setCustomers} customers={customers} leadsReady={leadsReady} />
         )}
         {tab === "customers" && (
           <CustomersTab customers={customers} setCustomers={setCustomers} sessions={sessions} staff={staff} role={role} />
@@ -661,7 +682,7 @@ export default function GymApp({ myStaffId, myRole, myName }) {
 /* ---------------------------------------------------------------
    DASHBOARD
 ------------------------------------------------------------------*/
-function Dashboard({ customers, sessions, staff, role, onMarkAttendance, setCustomers, currentPtId }) {
+function Dashboard({ customers, sessions, staff, role, onMarkAttendance, setCustomers, currentPtId, dueLeads = [], onOpenLeads }) {
   const today = todayStr();
   const todays = sessions.filter((s) => s.date === today).sort((a, b) => timeToMin(a.startTime) - timeToMin(b.startTime));
   const [showPackageList, setShowPackageList] = useState(false);
@@ -823,13 +844,17 @@ function Dashboard({ customers, sessions, staff, role, onMarkAttendance, setCust
         </Card>
 
         <Card title="Dikkat gerekiyor">
-          {packageWarnings.length === 0 && (role !== "owner" || overdue.length === 0) && (
+          {packageWarnings.length === 0 && (role !== "owner" || (overdue.length === 0 && dueLeads.length === 0)) && (
             <EmptyState text="Her şey yolunda — acil bir durum yok." />
           )}
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {packageWarnings.map((w) => (
               <AlertRow key={w.customer.id + w.pkg.id} tone={w.expiringSoon ? "warn" : "info"}
                 text={`${w.customer.name} — ${SESSION_TYPES[w.pkg.type].label}: ${warningReasonText(w)}`} />
+            ))}
+            {role === "owner" && [...dueLeads].sort((a, b) => (a.followUpDate < b.followUpDate ? -1 : 1)).slice(0, 6).map((l) => (
+              <AlertRow key={"lead" + l.id} tone={l.followUpDate < todayStr() ? "danger" : "warn"} onClick={onOpenLeads}
+                text={`Aranacak: ${l.name} — ${leadDueLabel(l.followUpDate)}`} />
             ))}
             {role === "owner" && overdue.map((c) => (
               <AlertRow key={"owe" + c.id} tone="danger"
@@ -852,10 +877,10 @@ function Dashboard({ customers, sessions, staff, role, onMarkAttendance, setCust
   );
 }
 
-function AlertRow({ text, tone }) {
+function AlertRow({ text, tone, onClick }) {
   const colors = { warn: "#E2A33D", danger: "#C1443C", info: "#3E6FA6" };
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 10, ...(onClick ? { cursor: "pointer" } : {}) }} onClick={onClick}>
       <div style={{ width: 6, height: 6, borderRadius: 99, background: colors[tone], flexShrink: 0 }} />
       <div style={{ fontSize: 13.5 }}>{text}</div>
     </div>
@@ -2788,6 +2813,281 @@ function PayoutStatementTab({ customers, sessions, staff, commissionRates }) {
 /* ---------------------------------------------------------------
    HOCALAR (STAFF)
 ------------------------------------------------------------------*/
+
+
+/* ------------------------------------------------------------------
+   POTANSİYEL ÜYELER (LEADS) — people who called or messaged and need a
+   follow-up call, each with a reminder date. Admin-only.
+------------------------------------------------------------------- */
+const LEAD_STATUS = {
+  new:       { label: "Yeni",          tone: "warn" },
+  contacted: { label: "Arandı",        tone: "neutral" },
+  trial:     { label: "Deneme seansı", tone: "ok" },
+  won:       { label: "Üye oldu",      tone: "ok" },
+  lost:      { label: "Vazgeçti",      tone: "danger" },
+};
+const LEAD_SOURCES = ["Telefon", "WhatsApp", "Instagram", "Tavsiye", "Salona geldi", "Diğer"];
+const LEAD_INTERESTS = ["PT", "Private Zone", "Grup dersi", "Pilates", "Henüz belli değil"];
+function isLeadActive(l) { return l.status !== "won" && l.status !== "lost"; }
+function leadDueLabel(dateStr) {
+  if (!dateStr) return "tarih yok";
+  const today = todayStr();
+  if (dateStr === today) return "bugün";
+  const diff = Math.round((new Date(today + "T00:00:00") - new Date(dateStr + "T00:00:00")) / 86400000);
+  if (diff > 0) return `${diff} gün gecikti`;
+  if (diff === -1) return "yarın";
+  return new Date(dateStr + "T00:00:00").toLocaleDateString("tr-TR", { day: "numeric", month: "long" });
+}
+
+function LeadsTab({ leads, setLeads, setCustomers, customers, leadsReady }) {
+  const [query, setQuery] = useState("");
+  const [editing, setEditing] = useState(null); // lead object | "new" | null
+  const [menuId, setMenuId] = useState(null);   // which card has the "Arandı" menu open
+  const [showClosed, setShowClosed] = useState(false);
+  const today = todayStr();
+
+  const q = query.trim().toLowerCase();
+  const visible = leads.filter((l) => !q || l.name.toLowerCase().includes(q) || (l.phone || "").includes(q));
+  const byDate = (a, b) => ((a.followUpDate || "9999") < (b.followUpDate || "9999") ? -1 : 1);
+  const active = visible.filter(isLeadActive).sort(byDate);
+  const sections = [
+    { key: "late", title: "Gecikmiş", tone: "danger", items: active.filter((l) => l.followUpDate && l.followUpDate < today) },
+    { key: "today", title: "Bugün", tone: "warn", items: active.filter((l) => l.followUpDate === today) },
+    { key: "soon", title: "Yaklaşan", tone: "neutral", items: active.filter((l) => l.followUpDate && l.followUpDate > today) },
+    { key: "none", title: "Tarihi yok", tone: "neutral", items: active.filter((l) => !l.followUpDate) },
+  ].filter((x) => x.items.length > 0);
+  const closed = visible.filter((l) => !isLeadActive(l)).sort((a, b) => ((b.createdAt || "") < (a.createdAt || "") ? -1 : 1));
+
+  function saveLead(data) {
+    setLeads((prev) => (prev.some((l) => l.id === data.id) ? prev.map((l) => (l.id === data.id ? { ...l, ...data } : l)) : [...prev, data]));
+    setEditing(null);
+  }
+  function removeLead(id) {
+    setLeads((prev) => prev.filter((l) => l.id !== id));
+    setEditing(null);
+  }
+  // "I called them" — log it in the notes, and set the next reminder.
+  function called(lead, days) {
+    const stamp = new Date().toLocaleDateString("tr-TR", { day: "numeric", month: "short" });
+    setLeads((prev) => prev.map((l) => l.id === lead.id ? {
+      ...l, status: l.status === "new" ? "contacted" : l.status,
+      followUpDate: addDays(todayStr(), days),
+      notes: `[${stamp}] Arandı.${l.notes ? "\n" + l.notes : ""}`,
+    } : l));
+    setMenuId(null);
+  }
+  function convertToMember(lead) {
+    if (!confirm(`${lead.name} üye olarak eklensin mi? (Paketi sonra Üyeler sekmesinden ekleyebilirsiniz.)`)) return;
+    setCustomers((prev) => [...prev, {
+      id: uid(), name: lead.name, phone: lead.phone || "", email: "", tcNo: null,
+      membershipFormDone: false, balance: 0, notes: lead.notes || "", packages: [],
+    }]);
+    setLeads((prev) => prev.map((l) => (l.id === lead.id ? { ...l, status: "won", followUpDate: "" } : l)));
+    setEditing(null);
+    alert(`${lead.name} üye olarak eklendi. Üyeler sekmesinden paket ekleyebilirsiniz.`);
+  }
+  function openWhatsApp(lead) {
+    const phone = waPhone(lead.phone);
+    if (phone) window.open(`https://web.whatsapp.com/send?phone=${phone}`, "whatsapp_web");
+  }
+
+  function LeadCard({ l }) {
+    const st = LEAD_STATUS[l.status] || LEAD_STATUS.new;
+    const hasPhone = !!waPhone(l.phone);
+    const overdue = isLeadActive(l) && l.followUpDate && l.followUpDate < today;
+    return (
+      <div style={styles.card}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ fontWeight: 700, fontSize: 15 }}>{l.name}</div>
+          <Pill tone={st.tone}>{st.label}</Pill>
+          {isLeadActive(l) && (
+            <span style={{ marginLeft: "auto", fontSize: 12.5, fontWeight: 600, color: overdue ? "#C1443C" : "var(--muted)", textTransform: "capitalize" }}>
+              {leadDueLabel(l.followUpDate)}
+            </span>
+          )}
+        </div>
+        <div style={{ fontSize: 12.5, color: "var(--muted)", marginTop: 4 }}>
+          {[l.phone, l.source && `Kaynak: ${l.source}`, l.interest && `İlgi: ${l.interest}`].filter(Boolean).join(" · ") || "—"}
+        </div>
+        {l.notes && (
+          <div style={{ fontSize: 13, marginTop: 8, whiteSpace: "pre-wrap", lineHeight: 1.45 }}>
+            {l.notes.length > 220 ? l.notes.slice(0, 220) + "…" : l.notes}
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+          {l.phone && (
+            <a href={`tel:${l.phone.replace(/\s+/g, "")}`} style={{ ...styles.secondaryBtnSm, textDecoration: "none" }}>
+              <PhoneCall size={14} /> Ara
+            </a>
+          )}
+          <button style={{ ...styles.secondaryBtnSm, opacity: hasPhone ? 1 : 0.5 }} disabled={!hasPhone} onClick={() => openWhatsApp(l)}>
+            <MessageCircle size={14} /> WhatsApp
+          </button>
+          {isLeadActive(l) && (
+            <button style={styles.primaryBtnSm} onClick={() => setMenuId(menuId === l.id ? null : l.id)}>
+              <CheckCircle2 size={13} /> Arandı
+            </button>
+          )}
+          <button style={styles.secondaryBtnSm} onClick={() => setEditing(l)}><Pencil size={13} /> Düzenle</button>
+        </div>
+        {menuId === l.id && (
+          <div style={{ marginTop: 10, padding: 10, background: "var(--surface-2)", borderRadius: 8 }}>
+            <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 8 }}>Bir sonraki hatırlatma ne zaman olsun?</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {[[1, "Yarın"], [3, "3 gün sonra"], [7, "1 hafta sonra"], [14, "2 hafta sonra"]].map(([d, label]) => (
+                <button key={d} style={styles.secondaryBtnSm} onClick={() => called(l, d)}>{label}</button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <PageHeader
+        eyebrow={`${leads.filter(isLeadActive).length} kişi takipte`}
+        title="Potansiyel Üyeler"
+        action={<button style={styles.primaryBtn} onClick={() => setEditing("new")}><Plus size={15} /> Kişi ekle</button>}
+      />
+
+      {!leadsReady && (
+        <div style={{ fontSize: 13, color: "#A6332B", background: "#FBE4E2", borderRadius: 8, padding: "10px 12px", marginBottom: 14 }}>
+          Potansiyel üyeler tablosu henüz kurulmamış. Supabase’de SQL Editor’de <b>leads-setup.sql</b> dosyasını çalıştırın, sonra sayfayı yenileyin. Bunu yapana kadar eklediğiniz kişiler kaydedilmez.
+        </div>
+      )}
+
+      <div style={styles.searchBar}>
+        <Search size={15} color="var(--muted)" />
+        <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="İsim veya telefon ile ara…" style={styles.searchInput} />
+      </div>
+
+      {leads.length === 0 && <EmptyState text="Henüz kimse eklenmedi. Arayan veya mesaj atan birini “Kişi ekle” ile kaydedin." />}
+
+      {sections.map((sec) => (
+        <div key={sec.key} style={{ marginTop: 18 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5 }}>{sec.title}</div>
+            <Pill tone={sec.tone}>{sec.items.length}</Pill>
+          </div>
+          <div style={{ display: "grid", gap: 10 }}>
+            {sec.items.map((l) => <LeadCard key={l.id} l={l} />)}
+          </div>
+        </div>
+      ))}
+
+      {closed.length > 0 && (
+        <div style={{ marginTop: 22 }}>
+          <button style={styles.linkBtn} onClick={() => setShowClosed((v) => !v)}>
+            {showClosed ? "Kapananları gizle" : `Kapananları göster (${closed.length})`}
+          </button>
+          {showClosed && (
+            <div style={{ display: "grid", gap: 10, marginTop: 10 }}>
+              {closed.map((l) => <LeadCard key={l.id} l={l} />)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {editing && (
+        <LeadModal
+          initial={editing === "new" ? null : editing}
+          onClose={() => setEditing(null)}
+          onSave={saveLead}
+          onDelete={removeLead}
+          onConvert={convertToMember}
+          duplicate={(phoneVal, id) => {
+            const digits = waPhone(phoneVal);
+            if (!digits) return null;
+            const asLead = leads.find((l) => l.id !== id && waPhone(l.phone) === digits);
+            const asMember = customers.find((c) => waPhone(c.phone) === digits);
+            return asLead ? `${asLead.name} (potansiyel üye)` : asMember ? `${asMember.name} (üye)` : null;
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function LeadModal({ initial, onClose, onSave, onDelete, onConvert, duplicate }) {
+  const [name, setName] = useState(initial?.name || "");
+  const [phone, setPhone] = useState(initial?.phone || "");
+  const [source, setSource] = useState(initial?.source || "");
+  const [interest, setInterest] = useState(initial?.interest || "");
+  const [notes, setNotes] = useState(initial?.notes || "");
+  const [followUpDate, setFollowUpDate] = useState(initial ? initial.followUpDate || "" : addDays(todayStr(), 1));
+  const [status, setStatus] = useState(initial?.status || "new");
+  const dup = duplicate(phone, initial?.id);
+
+  function handleSave() {
+    if (!name.trim()) return;
+    onSave({
+      id: initial?.id || uid(), name: name.trim(), phone: phone.trim(), source, interest,
+      notes: notes.trim(), followUpDate: isLeadActiveStatus(status) ? followUpDate : "",
+      status, createdAt: initial?.createdAt || new Date().toISOString(),
+    });
+  }
+  function isLeadActiveStatus(st) { return st !== "won" && st !== "lost"; }
+
+  return (
+    <Modal title={initial ? "Kişiyi düzenle" : "Yeni potansiyel üye"} onClose={onClose}>
+      <Field label="Ad Soyad">
+        <input autoFocus style={styles.input} value={name} onChange={(e) => setName(e.target.value)} />
+      </Field>
+      <Field label="Telefon">
+        <input style={styles.input} type="tel" inputMode="tel" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="05xx xxx xx xx" />
+      </Field>
+      {dup && (
+        <div style={{ fontSize: 12.5, color: "#95651A", background: "#FBF0DC", borderRadius: 8, padding: "8px 10px", marginBottom: 10 }}>
+          Bu numara zaten kayıtlı: {dup}.
+        </div>
+      )}
+      <div style={styles.fieldRow} className="responsive-row">
+        <Field label="Nereden ulaştı?">
+          <select style={styles.input} value={source} onChange={(e) => setSource(e.target.value)}>
+            <option value="">Seçin…</option>
+            {LEAD_SOURCES.map((x) => <option key={x} value={x}>{x}</option>)}
+          </select>
+        </Field>
+        <Field label="İlgilendiği hizmet">
+          <select style={styles.input} value={interest} onChange={(e) => setInterest(e.target.value)}>
+            <option value="">Seçin…</option>
+            {LEAD_INTERESTS.map((x) => <option key={x} value={x}>{x}</option>)}
+          </select>
+        </Field>
+      </div>
+      <Field label="Notlar">
+        <textarea style={{ ...styles.input, minHeight: 90, resize: "vertical", fontFamily: "inherit" }} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Ne dedi, ne zaman uygun, hedefi, fiyat sordu mu…" />
+      </Field>
+      <div style={styles.fieldRow} className="responsive-row">
+        <Field label="Ne zaman aranacak?">
+          <input style={styles.input} type="date" value={followUpDate} onChange={(e) => setFollowUpDate(e.target.value)} disabled={!isLeadActiveStatus(status)} />
+        </Field>
+        {initial && (
+          <Field label="Durum">
+            <select style={styles.input} value={status} onChange={(e) => setStatus(e.target.value)}>
+              {Object.entries(LEAD_STATUS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+            </select>
+          </Field>
+        )}
+      </div>
+
+      <div style={styles.modalActions}>
+        {initial && (
+          <button style={{ ...styles.secondaryBtn, marginRight: "auto" }} onClick={() => { if (confirm("Bu kişiyi silmek istediğinize emin misiniz?")) onDelete(initial.id); }}>
+            <Trash2 size={13} /> Sil
+          </button>
+        )}
+        {initial && initial.status !== "won" && (
+          <button style={styles.secondaryBtn} onClick={() => onConvert({ ...initial, name: name.trim() || initial.name, phone, notes })}>Üye olarak ekle</button>
+        )}
+        <button style={styles.secondaryBtn} onClick={onClose}>Vazgeç</button>
+        <button style={{ ...styles.primaryBtn, opacity: name.trim() ? 1 : 0.5 }} disabled={!name.trim()} onClick={handleSave}>Kaydet</button>
+      </div>
+    </Modal>
+  );
+}
 
 /* ------------------------------------------------------------------
    HAFTALIK RAPOR — one card per trainer with that trainer's week,

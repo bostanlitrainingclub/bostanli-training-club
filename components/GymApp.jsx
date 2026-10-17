@@ -204,43 +204,32 @@ function computeTrainerEarnings(ptId, monthStr, sessions, customers, commissionR
   return { rows, total };
 }
 
-// Same maths as computeTrainerEarnings, but kept session by session so it can be shown as a
-// statement. Every attended member in a session earns the trainer
-// (package price / package size) x the trainer's % for that member and session type.
-function computeTrainerStatement(ptId, monthStr, sessions, customers, commissionRates) {
-  const lines = [];
-  let missingPrice = 0;
-  sessions.forEach((s) => {
-    if (s.ptId !== ptId || !s.date.startsWith(monthStr)) return;
-    const people = [];
-    let earned = 0;
-    (s.customerIds || []).forEach((cid) => {
-      if (s.attendance?.[cid] !== "attended") return;
-      const customer = customers.find((c) => c.id === cid);
-      if (!customer) return;
-      const pkg = findPackageForType(customer, s.type);
-      const perSession = pkg && pkg.price ? pkg.price / pkg.sessionCount : 0;
-      const pct = getCommissionRate(commissionRates, ptId, cid, s.type);
-      const amount = perSession * (pct / 100);
-      if (!perSession) missingPrice += 1;
-      earned += amount;
-      people.push({ name: customer.name, amount, pct, noPrice: !perSession });
+// PAYMENT-BASED PAY. A trainer is owed a percentage of what a client actually PAID, not of the
+// lessons taught. Each package records its trainer (ptId) and that trainer's share (ptPct).
+// ptId "" = nobody chosen yet (flagged in the report); ptId "gym" = the gym keeps it all.
+// A payment counts in the calendar month it was marked paid (paidDate).
+const PT_GYM = "gym";
+const pkgTrainerName = (p, staff) =>
+  !p || !p.ptId ? "" : p.ptId === PT_GYM ? "Salon" : ((staff || []).find((t) => t.id === p.ptId)?.name || "");
+function computeTrainerPayments(monthStr, customers) {
+  const rows = [];
+  customers.forEach((c) => (c.packages || []).forEach((p) => {
+    const amount = Number(p.price) || 0;
+    if (!p.paid || !amount) return;
+    const paidOn = p.paidDate || p.purchaseDate || "";
+    if (!paidOn.startsWith(monthStr)) return;
+    const ptId = p.ptId || "";
+    const pct = Math.max(0, Math.min(100, Number(p.ptPct) || 0));
+    const count = Number(p.sessionCount) || 0;
+    const used = Number(p.sessionsUsed) || 0;
+    rows.push({
+      customer: c, pkg: p, paidOn, amount, ptId, pct, count, used,
+      remaining: Math.max(0, count - used),
+      share: ptId && ptId !== PT_GYM ? amount * (pct / 100) : 0,
     });
-    if (people.length === 0) return;
-    lines.push({ session: s, people, earned });
-  });
-  lines.sort((a, b) =>
-    a.session.date === b.session.date
-      ? timeToMin(a.session.startTime) - timeToMin(b.session.startTime)
-      : a.session.date < b.session.date ? -1 : 1);
-  const total = lines.reduce((sum, l) => sum + l.earned, 0);
-  // Lessons that already took place but whose attendance nobody confirmed yet are NOT in the total.
-  const now = Date.now();
-  const unconfirmed = sessions.filter((s) =>
-    s.ptId === ptId && s.date.startsWith(monthStr) && (s.customerIds || []).length > 0 &&
-    sessionEndMs(s) <= now && (s.customerIds || []).some((cid) => !s.attendance?.[cid])
-  ).length;
-  return { lines, total, missingPrice, unconfirmed };
+  }));
+  rows.sort((a, b) => (a.paidOn === b.paidOn ? a.customer.name.localeCompare(b.customer.name, "tr") : a.paidOn < b.paidOn ? -1 : 1));
+  return rows;
 }
 const fmtTL = (n) => `${Number(n || 0).toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} TL`;
 
@@ -669,7 +658,7 @@ export default function GymApp({ myStaffId, myRole, myName }) {
           <PaymentsTab customers={customers} setCustomers={setCustomers} sessions={sessions} staff={staff} />
         )}
         {tab === "payouts" && role === "owner" && (
-          <PayoutStatementTab customers={customers} sessions={sessions} staff={staff} commissionRates={commissionRates} />
+          <PayoutStatementTab customers={customers} staff={staff} />
         )}
         {tab === "reports" && role === "owner" && (
           <FinancialReportsTab customers={customers} sessions={sessions} staff={staff} commissionRates={commissionRates} />
@@ -984,6 +973,7 @@ function CustomersTab({ customers, setCustomers, sessions, staff, role }) {
                       return (
                         <Pill key={p.id} tone={!p.paid ? "danger" : warn ? "warn" : "neutral"}>
                           {SESSION_TYPES[p.type].label}: {p.sessionsUsed}/{p.sessionCount}
+                          {pkgTrainerName(p, staff) ? ` · ${pkgTrainerName(p, staff)}` : ""}
                           {p.expiryDate ? ` · Bitiş: ${p.expiryDate}` : ""}
                           {p.price ? ` · ${p.price} TL` : ""}
                           {!p.paid ? " · Ödenmedi" : ""}
@@ -1053,6 +1043,8 @@ function CustomerModal({ initial, onClose, onSave, sessions, staff }) {
       expiryDate: addDays(purchaseDate, 28), // 8 sessions ≈ 2x/week, 12 ≈ 3x/week — either way, 4 weeks
       price: "",
       paid: false,
+      ptId: "",
+      ptPct: DEFAULT_COMMISSION_PCT,
     }, ...prev]);
   }
   function updatePackage(id, field, value) {
@@ -1110,6 +1102,8 @@ function CustomerModal({ initial, onClose, onSave, sessions, staff }) {
         sessionsUsed: Number(p.sessionsUsed) || 0,
         price: p.price === "" ? null : Number(p.price),
         paid: !!p.paid,
+        ptId: p.ptId || "",
+        ptPct: p.ptPct === "" || p.ptPct == null ? 0 : Math.max(0, Math.min(100, Number(p.ptPct))),
       })),
     });
   }
@@ -1203,6 +1197,37 @@ function CustomerModal({ initial, onClose, onSave, sessions, staff }) {
             <Field label="Ücret (TL)">
               <input type="number" step="0.01" style={styles.input} value={p.price} onChange={(e) => updatePackage(p.id, "price", e.target.value)} placeholder="Bu üye için bu paketin ücreti" />
             </Field>
+            <div style={styles.fieldRow} className="responsive-row">
+              <Field label="Antrenör (hakediş kime gider?)">
+                <select
+                  style={styles.input}
+                  value={p.ptId || ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setPackages((prev) => prev.map((x) => (x.id === p.id
+                      ? { ...x, ptId: v, ptPct: x.ptPct === undefined || x.ptPct === "" || x.ptPct === null ? DEFAULT_COMMISSION_PCT : x.ptPct }
+                      : x)));
+                  }}
+                >
+                  <option value="">Seçilmedi</option>
+                  {staff.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+                  <option value={PT_GYM}>Salon (antrenör payı yok)</option>
+                </select>
+              </Field>
+              <Field label="Antrenör payı (%)">
+                <input
+                  type="number" min="0" max="100" style={styles.input}
+                  value={p.ptPct ?? ""} disabled={!p.ptId || p.ptId === PT_GYM}
+                  onChange={(e) => updatePackage(p.id, "ptPct", e.target.value)}
+                />
+              </Field>
+            </div>
+            {p.ptId && p.ptId !== PT_GYM && Number(p.price) > 0 && (
+              <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 6 }}>
+                Antrenöre düşen: <b>{fmtTL(Number(p.price) * (Math.max(0, Math.min(100, Number(p.ptPct) || 0)) / 100))}</b>
+                {p.paid ? "" : " (ödendi işaretlenince hakedişe girer)"}
+              </div>
+            )}
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", marginTop: 4 }}>
               <input type="checkbox" checked={!!p.paid} onChange={() => togglePaid(p.id)} />
               <span style={{ fontSize: 13 }}>
@@ -1259,6 +1284,19 @@ function MemberSummaryModal({ customer, sessions, staff, onClose }) {
       <div style={styles.fieldLabel}>Notlar</div>
       <div style={{ fontSize: 13.5, color: customer.notes ? "var(--ink)" : "var(--muted)", marginTop: 6, marginBottom: 18, whiteSpace: "pre-wrap" }}>
         {customer.notes || "Not eklenmedi."}
+      </div>
+
+      <div style={styles.fieldLabel}>Antrenör ve paket</div>
+      <div style={{ marginTop: 6, marginBottom: 18, display: "flex", flexDirection: "column", gap: 6 }}>
+        {(customer.packages || []).length === 0 && <div style={{ fontSize: 13, color: "var(--muted)" }}>Paket yok.</div>}
+        {(customer.packages || []).map((p) => {
+          const left = Math.max(0, (Number(p.sessionCount) || 0) - (Number(p.sessionsUsed) || 0));
+          return (
+            <div key={p.id} style={{ fontSize: 13.5 }}>
+              <b>{SESSION_TYPES[p.type].label}</b> · {pkgTrainerName(p, staff) || "Antrenör seçilmedi"} · {p.sessionsUsed}/{p.sessionCount} seans ({left} kalan)
+            </div>
+          );
+        })}
       </div>
 
       <div style={styles.fieldLabel}>Seanslar</div>
@@ -1626,16 +1664,14 @@ function SessionDetailModal({ session, sessions, staff, customers, onClose, onMa
           if (!cust) return null;
           const pkg = findPackageForType(cust, session.type);
           const decided = session.attendance?.[cid];
-          const showCommission = role === "owner" && session.ptId;
-          const commissionPct = showCommission ? getCommissionRate(commissionRates, session.ptId, cid, session.type) : null;
           return (
             <div key={cid} style={styles.packageRow}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: showCommission ? 8 : 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 0 }}>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 13.5 }}>{cust.name}</div>
                   {pkg && (
                     <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
-                      {pkg.sessionsUsed}/{pkg.sessionCount} seans kullanıldı
+                      {pkg.sessionsUsed}/{pkg.sessionCount} seans kullanıldı{pkgTrainerName(pkg, staff) ? ` · Antrenör: ${pkgTrainerName(pkg, staff)}` : ""}
                     </div>
                   )}
                 </div>
@@ -1652,22 +1688,6 @@ function SessionDetailModal({ session, sessions, staff, customers, onClose, onMa
                   <span style={{ fontSize: 11.5, color: "var(--muted)" }}>{ended ? "Onay bekliyor" : "Yaklaşan"}</span>
                 )}
               </div>
-              {showCommission && (
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 12, color: "var(--muted)" }}>
-                    {pt ? pt.name : "Antrenör"} payı ({cust.name}):
-                  </span>
-                  <input
-                    type="number" min="0" max="100" style={{ ...styles.input, width: 64, padding: "5px 8px" }}
-                    value={commissionPct}
-                    onChange={(e) => {
-                      const pct = Math.max(0, Math.min(100, Number(e.target.value) || 0));
-                      setCommissionRates((prev) => ({ ...prev, [commissionKey(session.ptId, cid, session.type)]: pct }));
-                    }}
-                  />
-                  <span style={{ fontSize: 12, color: "var(--muted)" }}>%</span>
-                </div>
-              )}
             </div>
           );
         })}
@@ -2567,8 +2587,9 @@ function FinancialReportsTab({ customers, sessions, staff, commissionRates }) {
     revenueByType[r.pkg.type] = (revenueByType[r.pkg.type] || 0) + (r.pkg.price || 0);
   });
 
+  const payRows = computeTrainerPayments(month, customers);
   const trainerPayouts = staff
-    .map((s) => ({ staffMember: s, ...computeTrainerEarnings(s.id, month, sessions, customers, commissionRates) }))
+    .map((s) => ({ staffMember: s, total: payRows.filter((r) => r.ptId === s.id).reduce((sum, r) => sum + r.share, 0) }))
     .filter((t) => t.total > 0)
     .sort((a, b) => b.total - a.total);
   const totalPayouts = trainerPayouts.reduce((sum, t) => sum + t.total, 0);
@@ -2626,82 +2647,61 @@ function FinancialReportsTab({ customers, sessions, staff, commissionRates }) {
 
 
 /* ------------------------------------------------------------------
-   HAKEDİŞ RAPORU — month-end statement per trainer: every confirmed
-   lesson (by week/day, with the member or group class), what it earned,
-   and the total owed for the calendar month.
+   HAKEDİŞ RAPORU — payment-based. A trainer earns a percentage of what each
+   of their clients PAID in the calendar month (not of lessons taught).
+   Paid at the start of the following month.
 ------------------------------------------------------------------- */
-function PayoutStatementTab({ customers, sessions, staff, commissionRates }) {
+function PayoutStatementTab({ customers, staff }) {
   const [month, setMonth] = useState(currentMonthStr());
   const [copiedId, setCopiedId] = useState(null);
-  const monthStart = `${month}-01`;
-  const monthEnd = toDateStr(new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0));
+  const rows = computeTrainerPayments(month, customers);
   const dShort = (d) => new Date(d + "T00:00:00").toLocaleDateString("tr-TR", { day: "numeric", month: "long" });
-  const dLong = (d) => new Date(d + "T00:00:00").toLocaleDateString("tr-TR", { weekday: "long", day: "numeric", month: "long" });
+  const payDayLabel = new Date(`${shiftMonth(month, 1)}-01T00:00:00`).toLocaleDateString("tr-TR", { day: "numeric", month: "long", year: "numeric" });
+  const staffIds = new Set(staff.map((t) => t.id));
 
-  const statements = staff
+  const unassigned = rows.filter((r) => !r.ptId || (r.ptId !== PT_GYM && !staffIds.has(r.ptId)));
+  const groups = staff
     .map((t) => {
-      const st = computeTrainerStatement(t.id, month, sessions, customers, commissionRates);
-      // Group lines into Monday-to-Sunday weeks, clipped to this month.
-      const weeks = [];
-      st.lines.forEach((l) => {
-        const ws = mondayOf(l.session.date);
-        let w = weeks.find((x) => x.ws === ws);
-        if (!w) {
-          const from = ws < monthStart ? monthStart : ws;
-          const toRaw = addDays(ws, 6);
-          const to = toRaw > monthEnd ? monthEnd : toRaw;
-          w = { ws, label: `${dShort(from)} – ${dShort(to)}`, lines: [], subtotal: 0 };
-          weeks.push(w);
-        }
-        w.lines.push(l);
-        w.subtotal += l.earned;
-      });
-      return { trainer: t, ...st, weeks };
+      const mine = rows.filter((r) => r.ptId === t.id);
+      return { trainer: t, rows: mine, total: mine.reduce((sum, r) => sum + r.share, 0), collected: mine.reduce((sum, r) => sum + r.amount, 0) };
     })
-    .filter((x) => x.lines.length > 0 || x.unconfirmed > 0)
+    .filter((g) => g.rows.length > 0)
     .sort((a, b) => b.total - a.total);
-  const grand = statements.reduce((sum, x) => sum + x.total, 0);
+  const totalCollected = rows.reduce((sum, r) => sum + r.amount, 0);
+  const totalOwed = groups.reduce((sum, g) => sum + g.total, 0);
+  const unassignedAmount = unassigned.reduce((sum, r) => sum + r.amount, 0);
 
-  const lessonName = (l) => sessionLabel(l.session);
-  const whoText = (l) => {
-    const names = l.people.map((p) => p.name);
-    return l.session.type === "group" || l.session.type === "pilates"
-      ? `${names.length} kişi: ${names.join(", ")}` : names.join(", ");
-  };
-
-  function summaryText(x) {
-    let t = `Merhaba ${(x.trainer.name || "").split(" ")[0]}, ${monthLabel(month)} hakediş özetin:\n`;
-    x.weeks.forEach((w) => {
-      t += `\n${w.label}: ${w.lines.length} ders – ${fmtTL(w.subtotal)}`;
-    });
-    t += `\n\n*Toplam: ${x.lines.length} ders – ${fmtTL(x.total)}*\n\nAyrıntılı döküm PDF olarak ekte.`;
+  const lineText = (r) => `${dShort(r.paidOn)} – ${r.customer.name} (${r.count} seans): ${fmtTL(r.amount)} × %${r.pct} = ${fmtTL(r.share)}`;
+  function summaryText(g) {
+    const MAX = 30;
+    let t = `Merhaba ${(g.trainer.name || "").split(" ")[0]}, ${monthLabel(month)} ayında müşterilerinden gelen ödemeler ve hakedişin:\n\n`;
+    t += g.rows.slice(0, MAX).map(lineText).join("\n");
+    if (g.rows.length > MAX) t += `\n…ve ${g.rows.length - MAX} ödeme daha (PDF ekte)`;
+    t += `\n\n*Toplam hakediş: ${fmtTL(g.total)}*\nÖdeme tarihi: ${payDayLabel}`;
     return t;
   }
-  function sendWhatsApp(x) {
-    const phone = waPhone(x.trainer.phone);
-    if (!phone) return;
-    window.open(`https://web.whatsapp.com/send?phone=${phone}&text=${encodeURIComponent(summaryText(x))}`, "whatsapp_web");
+  function sendWhatsApp(g) {
+    const phone = waPhone(g.trainer.phone);
+    if (phone) window.open(`https://web.whatsapp.com/send?phone=${phone}&text=${encodeURIComponent(summaryText(g))}`, "whatsapp_web");
   }
-  async function copySummary(x) {
-    try { await navigator.clipboard.writeText(summaryText(x)); } catch (e) { /* ignore */ }
-    setCopiedId(x.trainer.id);
+  async function copySummary(g) {
+    try { await navigator.clipboard.writeText(summaryText(g)); } catch (e) { /* ignore */ }
+    setCopiedId(g.trainer.id);
     setTimeout(() => setCopiedId(null), 1800);
   }
-
-  function statementHtml(x) {
+  function statementHtml(g) {
     const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
-    const weeksHtml = x.weeks.map((w) => `
-      <h3>${esc(w.label)}</h3>
-      <table><thead><tr><th>Tarih</th><th>Saat</th><th>Ders</th><th>Üye</th><th class="r">Kazanç</th></tr></thead><tbody>
-      ${w.lines.map((l) => `<tr><td>${esc(dLong(l.session.date))}</td><td>${esc(l.session.startTime)}</td><td>${esc(lessonName(l))}</td><td>${esc(whoText(l))}</td><td class="r">${esc(fmtTL(l.earned))}</td></tr>`).join("")}
-      <tr class="sub"><td colspan="4">Hafta toplamı (${w.lines.length} ders)</td><td class="r">${esc(fmtTL(w.subtotal))}</td></tr>
-      </tbody></table>`).join("");
-    return `<section class="stmt"><h1>Bostanlı Training Club</h1><h2>${esc(x.trainer.name)} — ${esc(monthLabel(month))} hakediş dökümü</h2>${weeksHtml}
-      <div class="total">Ay toplamı (${x.lines.length} ders): ${esc(fmtTL(x.total))}</div>
-      <p class="note">Yalnızca katılımı onaylanmış dersler listelenmiştir. Hazırlanma tarihi: ${esc(new Date().toLocaleDateString("tr-TR"))}</p></section>`;
+    return `<section class="stmt"><h1>Bostanlı Training Club</h1>
+      <h2>${esc(g.trainer.name)} — ${esc(monthLabel(month))} hakediş dökümü</h2>
+      <table><thead><tr><th>Ödeme tarihi</th><th>Üye</th><th>Paket</th><th class="r">Ödenen</th><th class="r">Pay</th><th class="r">Hakediş</th></tr></thead><tbody>
+      ${g.rows.map((r) => `<tr><td>${esc(dShort(r.paidOn))}</td><td>${esc(r.customer.name)}</td><td>${esc(SESSION_TYPES[r.pkg.type].label)} · ${r.count} seans</td><td class="r">${esc(fmtTL(r.amount))}</td><td class="r">%${r.pct}</td><td class="r">${esc(fmtTL(r.share))}</td></tr>`).join("")}
+      <tr class="sub"><td colspan="3">Toplam (${g.rows.length} ödeme)</td><td class="r">${esc(fmtTL(g.collected))}</td><td></td><td class="r">${esc(fmtTL(g.total))}</td></tr>
+      </tbody></table>
+      <div class="total">Ödenecek toplam: ${esc(fmtTL(g.total))}</div>
+      <p class="note">Ödeme tarihi: ${esc(payDayLabel)}. Hazırlanma tarihi: ${esc(new Date().toLocaleDateString("tr-TR"))}</p></section>`;
   }
   function printStatements(list) {
-    const css = `body{font-family:Arial,sans-serif;padding:24px;color:#161616}h1{font-size:20px;margin:0}h2{font-size:15px;margin:4px 0 16px;color:#444;text-transform:capitalize}h3{font-size:13px;margin:16px 0 6px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{border-bottom:1px solid #ddd;padding:5px 6px;text-align:left;vertical-align:top}th{background:#f3f3f3}.r{text-align:right;white-space:nowrap}.sub td{font-weight:bold;background:#fafafa}.total{margin-top:18px;font-size:16px;font-weight:bold;text-align:right}.note{font-size:11px;color:#777}.stmt{page-break-after:always}.stmt:last-child{page-break-after:auto}`;
+    const css = `body{font-family:Arial,sans-serif;padding:24px;color:#161616}h1{font-size:20px;margin:0}h2{font-size:15px;margin:4px 0 16px;color:#444;text-transform:capitalize}table{width:100%;border-collapse:collapse;font-size:12px}th,td{border-bottom:1px solid #ddd;padding:6px;text-align:left;vertical-align:top}th{background:#f3f3f3}.r{text-align:right;white-space:nowrap}.sub td{font-weight:bold;background:#fafafa}.total{margin-top:18px;font-size:16px;font-weight:bold;text-align:right}.note{font-size:11px;color:#777}.stmt{page-break-after:always}.stmt:last-child{page-break-after:auto}`;
     const w = window.open("", "_blank");
     if (!w) return;
     w.document.write(`<html><head><title>Hakediş ${monthLabel(month)}</title><style>${css}</style></head><body>${list.map(statementHtml).join("")}</body></html>`);
@@ -2713,10 +2713,10 @@ function PayoutStatementTab({ customers, sessions, staff, commissionRates }) {
   return (
     <div>
       <PageHeader
-        eyebrow="Ay sonu"
+        eyebrow="Ödemeye göre hakediş"
         title="Hakediş Raporu"
-        action={statements.length > 0 ? (
-          <button style={styles.primaryBtn} onClick={() => printStatements(statements.filter((x) => x.lines.length > 0))}>
+        action={groups.length > 0 ? (
+          <button style={styles.primaryBtn} onClick={() => printStatements(groups)}>
             <Printer size={15} /> Tümünü yazdır / PDF
           </button>
         ) : null}
@@ -2730,77 +2730,69 @@ function PayoutStatementTab({ customers, sessions, staff, commissionRates }) {
       </div>
 
       <div style={{ fontSize: 12.5, color: "var(--muted)", margin: "14px 0" }}>
-        Yalnızca katılımı onaylanmış dersler sayılır. Kazanç = (paket fiyatı ÷ paket seans sayısı) × antrenörün o üyedeki payı. Toplam, Finansal Raporlar’daki antrenör ödemesiyle aynıdır.
+        Her antrenör, o ay müşterilerinin <b>ödediği</b> paket tutarından kendi payını alır (paketin “Ödendi” işaretlendiği aya göre). Ödeme günü: <b>{payDayLabel}</b>.
       </div>
 
-      {statements.length > 0 && (
-        <div style={{ ...styles.card, marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ fontWeight: 600 }}>Bu ay tüm antrenörlere ödenecek</span>
-          <span style={{ fontWeight: 700, fontSize: 18 }}>{fmtTL(grand)}</span>
+      <div style={{ ...styles.grid3, marginBottom: 14 }}>
+        <StatCard label="Bu ay tahsil edilen" value={fmtTL(totalCollected)} icon={Wallet} tone="ok" />
+        <StatCard label="Antrenörlere ödenecek" value={fmtTL(totalOwed)} icon={Dumbbell} tone="warn" />
+        <StatCard label="Salonda kalan" value={fmtTL(totalCollected - totalOwed - unassignedAmount)} icon={TrendingUp} tone="ok" />
+      </div>
+
+      {unassigned.length > 0 && (
+        <div style={{ fontSize: 13, color: "#A6332B", background: "#FBE4E2", borderRadius: 8, padding: "10px 12px", marginBottom: 14 }}>
+          <b>{unassigned.length} ödeme için antrenör seçilmemiş</b> ({fmtTL(unassignedAmount)}) — hakediş hesaplanmadı:
+          <div style={{ marginTop: 4 }}>
+            {unassigned.map((r) => `${r.customer.name} (${SESSION_TYPES[r.pkg.type].label}, ${fmtTL(r.amount)})`).join(" · ")}
+          </div>
+          <div style={{ marginTop: 4 }}>Üyeler → üyeyi açın → ilgili paketin “Antrenör” alanını seçin.</div>
         </div>
       )}
-      {statements.length === 0 && <EmptyState text="Bu ay için onaylanmış ders yok." />}
+
+      {rows.length === 0 && <EmptyState text="Bu ay ödenmiş paket yok. Bir paketi “Ödendi” işaretlediğinizde burada görünür." />}
 
       <div style={{ display: "grid", gap: 14 }}>
-        {statements.map((x) => {
-          const hasPhone = !!waPhone(x.trainer.phone);
+        {groups.map((g) => {
+          const hasPhone = !!waPhone(g.trainer.phone);
           return (
-            <div key={x.trainer.id} style={styles.card}>
+            <div key={g.trainer.id} style={styles.card}>
               <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 6 }}>
-                <div style={{ fontWeight: 700, fontSize: 16 }}>{x.trainer.name}</div>
-                <Pill>{x.lines.length} ders</Pill>
-                <div style={{ marginLeft: "auto", fontWeight: 700, fontSize: 18 }}>{fmtTL(x.total)}</div>
+                <div style={{ fontWeight: 700, fontSize: 16 }}>{g.trainer.name}</div>
+                <Pill>{g.rows.length} ödeme</Pill>
+                <div style={{ marginLeft: "auto", fontWeight: 700, fontSize: 18 }}>{fmtTL(g.total)}</div>
               </div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
-                <button style={styles.secondaryBtnSm} onClick={() => printStatements([x])} disabled={x.lines.length === 0}>
-                  <Printer size={14} /> Yazdır / PDF
-                </button>
-                <button style={styles.secondaryBtnSm} onClick={() => copySummary(x)} disabled={x.lines.length === 0}>
-                  <Copy size={14} /> {copiedId === x.trainer.id ? "Kopyalandı" : "Özeti kopyala"}
+                <button style={styles.secondaryBtnSm} onClick={() => printStatements([g])}><Printer size={14} /> Yazdır / PDF</button>
+                <button style={styles.secondaryBtnSm} onClick={() => copySummary(g)}>
+                  <Copy size={14} /> {copiedId === g.trainer.id ? "Kopyalandı" : "Özeti kopyala"}
                 </button>
                 <button
                   style={{ ...styles.secondaryBtnSm, opacity: hasPhone ? 1 : 0.5 }}
-                  disabled={!hasPhone || x.lines.length === 0}
-                  onClick={() => sendWhatsApp(x)}
+                  disabled={!hasPhone}
+                  onClick={() => sendWhatsApp(g)}
                   title={hasPhone ? "" : "Antrenörler sekmesinden telefon numarası ekleyin"}
                 >
-                  <MessageCircle size={14} /> Özeti WhatsApp’ta aç
+                  <MessageCircle size={14} /> WhatsApp’ta aç
                 </button>
               </div>
 
-              {x.unconfirmed > 0 && (
-                <div style={{ fontSize: 12.5, color: "#95651A", background: "#FBF0DC", borderRadius: 8, padding: "8px 10px", marginBottom: 10 }}>
-                  {x.unconfirmed} ders için katılım henüz onaylanmadı — bunlar toplama dahil değil. Panel’den onaylayın.
-                </div>
-              )}
-              {x.missingPrice > 0 && (
-                <div style={{ fontSize: 12.5, color: "#A6332B", background: "#FBE4E2", borderRadius: 8, padding: "8px 10px", marginBottom: 10 }}>
-                  {x.missingPrice} katılım için üyenin paket fiyatı girilmemiş — 0 TL sayıldı. Üyeler sekmesinden fiyatı ekleyin.
-                </div>
-              )}
-
-              {x.weeks.map((w) => (
-                <div key={w.ws} style={{ marginTop: 12 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 600, fontSize: 13, paddingBottom: 6, borderBottom: "1px solid var(--border)" }}>
-                    <span>{w.label}</span>
-                    <span>{fmtTL(w.subtotal)}</span>
-                  </div>
-                  {w.lines.map((l) => (
-                    <div key={l.session.id} style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "7px 0", borderBottom: "1px solid var(--border)", fontSize: 13 }}>
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{ fontWeight: 600 }}>
-                          {dLong(l.session.date)} · {l.session.startTime} · {lessonName(l)}
-                        </div>
-                        <div style={{ color: "var(--muted)", fontSize: 12.5 }}>{whoText(l)}{l.people.some((p) => p.noPrice) ? " · fiyat yok" : ""}</div>
-                      </div>
-                      <div style={{ fontWeight: 700, whiteSpace: "nowrap" }}>{fmtTL(l.earned)}</div>
+              {g.rows.map((r) => (
+                <div key={r.customer.id + r.pkg.id} style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "8px 0", borderTop: "1px solid var(--border)", fontSize: 13 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontWeight: 600 }}>{dShort(r.paidOn)} · {r.customer.name}</div>
+                    <div style={{ color: "var(--muted)", fontSize: 12.5 }}>
+                      {SESSION_TYPES[r.pkg.type].label} · {r.count} seanslık paket · {r.used} kullanıldı · <b>{r.remaining} kalan</b>
                     </div>
-                  ))}
+                  </div>
+                  <div style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                    <div style={{ fontWeight: 700 }}>{fmtTL(r.share)}</div>
+                    <div style={{ color: "var(--muted)", fontSize: 12.5 }}>{fmtTL(r.amount)} × %{r.pct}</div>
+                  </div>
                 </div>
               ))}
-              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 12, fontWeight: 700, fontSize: 15 }}>
-                <span>Ay toplamı</span>
-                <span>{fmtTL(x.total)}</span>
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, paddingTop: 10, borderTop: "1px solid var(--border)", fontWeight: 700, fontSize: 15 }}>
+                <span>Toplam hakediş ({fmtTL(g.collected)} tahsilattan)</span>
+                <span>{fmtTL(g.total)}</span>
               </div>
             </div>
           );
@@ -2809,11 +2801,6 @@ function PayoutStatementTab({ customers, sessions, staff, commissionRates }) {
     </div>
   );
 }
-
-/* ---------------------------------------------------------------
-   HOCALAR (STAFF)
-------------------------------------------------------------------*/
-
 
 /* ------------------------------------------------------------------
    POTANSİYEL ÜYELER (LEADS) — people who called or messaged and need a
@@ -3756,14 +3743,8 @@ function TrainerScheduleModal({ trainer, sessions, customers, commissionRates, s
       }, {})
     : null;
 
-  const { rows: earningsRows, total: earningsTotal } = computeTrainerEarnings(
-    trainer.id, earningsMonth, sessions, customers, commissionRates
-  );
-
-  function updatePct(customerId, type, value) {
-    const pct = Math.max(0, Math.min(100, Number(value) || 0));
-    setCommissionRates((prev) => ({ ...prev, [commissionKey(trainer.id, customerId, type)]: pct }));
-  }
+  const payRows = computeTrainerPayments(earningsMonth, customers).filter((r) => r.ptId === trainer.id);
+  const earningsTotal = payRows.reduce((sum, r) => sum + r.share, 0);
 
   return (
     <Modal title={`${trainer.name} · Programı`} onClose={onClose} width={820}>
@@ -3824,40 +3805,30 @@ function TrainerScheduleModal({ trainer, sessions, customers, commissionRates, s
             <button style={styles.linkBtn} onClick={() => setEarningsMonth(currentMonthStr())}>Bu ay</button>
           </div>
 
-          {earningsRows.length === 0 && (
-            <div style={{ marginTop: 14 }}><EmptyState text="Bu ay tamamlanan seans yok." /></div>
+          {payRows.length === 0 && (
+            <div style={{ marginTop: 14 }}><EmptyState text="Bu ay bu antrenöre ait ödeme yok." /></div>
           )}
 
           <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 14 }}>
-            {earningsRows.map((r) => (
-              <div key={r.customer.id + r.type} style={styles.packageRow}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+            {payRows.map((r) => (
+              <div key={r.customer.id + r.pkg.id} style={styles.packageRow}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
                   <div>
                     <div style={{ fontWeight: 600, fontSize: 13.5 }}>{r.customer.name}</div>
                     <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
-                      {SESSION_TYPES[r.type].label} · {r.count} seans
-                      {r.pkg?.price ? ` · ${r.pricePerSession.toFixed(0)} TL/seans` : " · paket ücreti girilmemiş"}
+                      {SESSION_TYPES[r.pkg.type].label} · {r.count} seans · {fmtTL(r.amount)} × %{r.pct}
                     </div>
                   </div>
-                  <div style={{ fontWeight: 700, fontSize: 14, whiteSpace: "nowrap" }}>{r.payout.toFixed(0)} TL</div>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 12, color: "var(--muted)" }}>Antrenör payı:</span>
-                  <input
-                    type="number" min="0" max="100" style={{ ...styles.input, width: 64, padding: "5px 8px" }}
-                    value={r.pct}
-                    onChange={(e) => updatePct(r.customer.id, r.type, e.target.value)}
-                  />
-                  <span style={{ fontSize: 12, color: "var(--muted)" }}>%</span>
+                  <div style={{ fontWeight: 700, fontSize: 14, whiteSpace: "nowrap" }}>{fmtTL(r.share)}</div>
                 </div>
               </div>
             ))}
           </div>
 
-          {earningsRows.length > 0 && (
+          {payRows.length > 0 && (
             <div style={styles.trainerEarningsTotal}>
               <span>Bu ay ödenecek toplam</span>
-              <span style={{ fontWeight: 700, fontSize: 16 }}>{earningsTotal.toFixed(0)} TL</span>
+              <span style={{ fontWeight: 700, fontSize: 16 }}>{fmtTL(earningsTotal)}</span>
             </div>
           )}
         </div>
